@@ -1,0 +1,22 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Platform22", "Platform22\Platform22.csproj", "{29C3BD02-A747-4B96-9A36-DB99F83A0B5E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PaulsTransitData", "PaulsTransitData\PaulsTransitData.csproj", "{A10F1441-D530-4BF3-A672-4B741A42D60F}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{29C3BD02-A747-4B96-9A36-DB99F83A0B5E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{29C3BD02-A747-4B96-9A36-DB99F83A0B5E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{29C3BD02-A747-4B96-9A36-DB99F83A0B5E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{29C3BD02-A747-4B96-9A36-DB99F83A0B5E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A10F1441-D530-4BF3-A672-4B741A42D60F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A10F1441-D530-4BF3-A672-4B741A42D60F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A10F1441-D530-4BF3-A672-4B741A42D60F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A10F1441-D530-4BF3-A672-4B741A42D60F}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
