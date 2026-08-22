@@ -148,7 +148,7 @@ public sealed class SshTransitHost : IDisposable
         private void StartProcess()
         {
             var assemblyPath = Assembly.GetEntryAssembly()?.Location ?? throw new InvalidOperationException("Cannot locate Platform22 assembly.");
-            var command = $"env -u PLATFORM22_SSH_MODE -u PLATFORM22_ORLEANS_MODE -u ORLEANS_GATEWAY_PORT -u ORLEANS_SILO_PORT dotnet {ShellQuote(assemblyPath)}";
+            var command = $"env -u PLATFORM22_SSH_MODE dotnet {ShellQuote(assemblyPath)}";
             var nextProcess = new Process
             {
                 StartInfo = new ProcessStartInfo
@@ -167,9 +167,6 @@ public sealed class SshTransitHost : IDisposable
             nextProcess.StartInfo.Environment["COLUMNS"] = Math.Max(40, size.Columns).ToString();
             nextProcess.StartInfo.Environment["LINES"] = Math.Max(10, size.Rows).ToString();
             nextProcess.StartInfo.Environment.Remove("PLATFORM22_SSH_MODE");
-            nextProcess.StartInfo.Environment.Remove("PLATFORM22_ORLEANS_MODE");
-            nextProcess.StartInfo.Environment.Remove("ORLEANS_GATEWAY_PORT");
-            nextProcess.StartInfo.Environment.Remove("ORLEANS_SILO_PORT");
 
             nextProcess.Exited += (_, _) => OnProcessExited(nextProcess);
 

@@ -12,21 +12,22 @@ using Platform22.Orleans;
 
 public sealed class TranslinkMapActor : ITransitMapClient, IAsyncDisposable
 {
-    private const string ShortNameContainsPrefix = "translink:short-name-contains:";
     private const string DirectoryKey = "translink";
     private static readonly TimeSpan SharedRefreshInterval = TimeSpan.FromSeconds(25);
-    private readonly TranslinkPTDClient providerClient;
+    private readonly TranslinkPTDClient? providerClient;
     private readonly HashSet<string> knownLineIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> knownStationIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim refreshLock = new(1, 1);
     private readonly Task<IClusterClient> clientTask;
     private readonly Task<IHost>? inProcessHostTask;
     private readonly Task<IHost>? externalClientHostTask;
+    private readonly bool externalOrleans;
 
-    public TranslinkMapActor(TranslinkPTDClient providerClient)
+    public TranslinkMapActor(TranslinkPTDClient? providerClient = null)
     {
         this.providerClient = providerClient;
-        if (UseExternalOrleans())
+        externalOrleans = UseExternalOrleans();
+        if (externalOrleans)
         {
             externalClientHostTask = StartExternalClientHostAsync();
             clientTask = GetClientFromHostAsync(externalClientHostTask);
@@ -54,7 +55,12 @@ public sealed class TranslinkMapActor : ITransitMapClient, IAsyncDisposable
                 return;
             }
 
-            var stations = await providerClient.GetStationsAsync(cancellationToken).ConfigureAwait(false);
+            if (externalOrleans)
+            {
+                return;
+            }
+
+            var stations = await GetProviderClient().GetStationsAsync(cancellationToken).ConfigureAwait(false);
             await directoryGrain
                 .SetStationsJsonAsync(JsonSerializer.Serialize(new StationDirectoryCache(stations, DateTimeOffset.UtcNow)))
                 .ConfigureAwait(false);
@@ -69,7 +75,7 @@ public sealed class TranslinkMapActor : ITransitMapClient, IAsyncDisposable
 
             foreach (var stationId in knownStationIds.ToArray())
             {
-                var snapshot = await providerClient.GetStationSnapshotAsync(stationId, cancellationToken).ConfigureAwait(false);
+                var snapshot = await GetProviderClient().GetStationSnapshotAsync(stationId, cancellationToken).ConfigureAwait(false);
                 await client.GetGrain<IStationSnapshotGrain>(stationId)
                     .SetSnapshotJsonAsync(JsonSerializer.Serialize(snapshot))
                     .ConfigureAwait(false);
@@ -83,10 +89,7 @@ public sealed class TranslinkMapActor : ITransitMapClient, IAsyncDisposable
 
     public Task<IReadOnlyList<PTDLineSummary>> GetLinesAsync(CancellationToken cancellationToken = default)
     {
-        return Task.FromResult<IReadOnlyList<PTDLineSummary>>(
-        [
-            new PTDLineSummary("translink:short-name-contains:VL", "Varsity Lakes services", "translink", "FFC425")
-        ]);
+        return Task.FromResult(TranslinkRailLineCatalog.GetLines());
     }
 
     public async Task<IReadOnlyList<PTDStationSummary>> GetStationsAsync(CancellationToken cancellationToken = default)
@@ -104,12 +107,17 @@ public sealed class TranslinkMapActor : ITransitMapClient, IAsyncDisposable
         var json = await grain.GetSnapshotJsonAsync().ConfigureAwait(false);
         if (json is null)
         {
-            var snapshot = await FetchLineSnapshotAsync(lineId, cancellationToken).ConfigureAwait(false);
+            if (externalOrleans)
+            {
+                throw new InvalidOperationException("Translink cache is warming. Try again shortly.");
+            }
+
+            var snapshot = WithCatalogLine(await FetchLineSnapshotAsync(lineId, cancellationToken).ConfigureAwait(false));
             json = JsonSerializer.Serialize(snapshot);
             await grain.SetSnapshotJsonAsync(json).ConfigureAwait(false);
         }
 
-        return JsonSerializer.Deserialize<PTDLineSnapshot>(json)!;
+        return WithCatalogLine(JsonSerializer.Deserialize<PTDLineSnapshot>(json)!);
     }
 
     public async Task<PTDStationSnapshot> GetStationSnapshotAsync(string stationId, CancellationToken cancellationToken = default)
@@ -120,7 +128,12 @@ public sealed class TranslinkMapActor : ITransitMapClient, IAsyncDisposable
         var json = await grain.GetSnapshotJsonAsync().ConfigureAwait(false);
         if (json is null)
         {
-            var snapshot = await providerClient.GetStationSnapshotAsync(stationId, cancellationToken).ConfigureAwait(false);
+            if (externalOrleans)
+            {
+                throw new InvalidOperationException("Translink cache is warming. Try again shortly.");
+            }
+
+            var snapshot = await GetProviderClient().GetStationSnapshotAsync(stationId, cancellationToken).ConfigureAwait(false);
             json = JsonSerializer.Serialize(snapshot);
             await grain.SetSnapshotJsonAsync(json).ConfigureAwait(false);
         }
@@ -150,12 +163,29 @@ public sealed class TranslinkMapActor : ITransitMapClient, IAsyncDisposable
 
     private Task<PTDLineSnapshot> FetchLineSnapshotAsync(string lineId, CancellationToken cancellationToken)
     {
-        if (lineId.StartsWith(ShortNameContainsPrefix, StringComparison.OrdinalIgnoreCase))
+        var shortNameAnyParts = TranslinkRailLineCatalog.GetShortNameAnyParts(lineId);
+        if (shortNameAnyParts.Length > 0)
         {
-            return providerClient.GetLineSnapshotByShortNameContainsAsync(lineId[ShortNameContainsPrefix.Length..], cancellationToken);
+            return GetProviderClient().GetLineSnapshotByShortNameAnyAsync(shortNameAnyParts, cancellationToken);
         }
 
-        return providerClient.GetLineSnapshotAsync(lineId, cancellationToken);
+        if (lineId.StartsWith(TranslinkRailLineCatalog.ShortNameContainsPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return GetProviderClient().GetLineSnapshotByShortNameContainsAsync(lineId[TranslinkRailLineCatalog.ShortNameContainsPrefix.Length..], cancellationToken);
+        }
+
+        return GetProviderClient().GetLineSnapshotAsync(lineId, cancellationToken);
+    }
+
+    private TranslinkPTDClient GetProviderClient()
+    {
+        return providerClient ?? throw new InvalidOperationException("Direct Translink provider access is disabled for this client.");
+    }
+
+    private static PTDLineSnapshot WithCatalogLine(PTDLineSnapshot snapshot)
+    {
+        var catalogLine = TranslinkRailLineCatalog.FindLine(snapshot.Line.Id);
+        return catalogLine is null ? snapshot : snapshot with { Line = catalogLine };
     }
 
     private static async Task<IHost> StartInProcessOrleansAsync()
@@ -187,6 +217,19 @@ public sealed class TranslinkMapActor : ITransitMapClient, IAsyncDisposable
             .ConfigureLogging(logging => logging.ClearProviders())
             .UseOrleansClient(client =>
             {
+                var valkeyConnectionString = Environment.GetEnvironmentVariable("ConnectionStrings__valkey")
+                    ?? Environment.GetEnvironmentVariable("ConnectionStrings:valkey");
+                if (!string.IsNullOrWhiteSpace(valkeyConnectionString)
+                    && !string.Equals(Environment.GetEnvironmentVariable("ORLEANS_CLUSTERING_MODE"), "kubernetes", StringComparison.OrdinalIgnoreCase))
+                {
+                    client.UseRedisClustering(options =>
+                    {
+                        options.ConfigurationOptions = StackExchange.Redis.ConfigurationOptions.Parse(valkeyConnectionString);
+                        options.EntryExpiry = TimeSpan.FromSeconds(30);
+                    });
+                    return;
+                }
+
                 var gatewayHost = Environment.GetEnvironmentVariable("ORLEANS_GATEWAY_HOST");
                 var gatewayPort = GetPort("ORLEANS_GATEWAY_PORT", 30000);
                 if (Uri.TryCreate(gatewayHost, UriKind.Absolute, out var gatewayUri))

@@ -5,7 +5,6 @@ using PaulsTransitData.Providers.Translink;
 
 public sealed class TranslinkMapClient : ITransitMapClient
 {
-    private const string ShortNameContainsPrefix = "translink:short-name-contains:";
     private readonly TranslinkPTDClient client;
 
     public TranslinkMapClient(TranslinkPTDClient client)
@@ -22,10 +21,7 @@ public sealed class TranslinkMapClient : ITransitMapClient
 
     public Task<IReadOnlyList<PTDLineSummary>> GetLinesAsync(CancellationToken cancellationToken = default)
     {
-        return Task.FromResult<IReadOnlyList<PTDLineSummary>>(
-        [
-            new PTDLineSummary("translink:short-name-contains:VL", "Varsity Lakes services", "translink", "FFC425")
-        ]);
+        return Task.FromResult(TranslinkRailLineCatalog.GetLines());
     }
 
     public Task<IReadOnlyList<PTDStationSummary>> GetStationsAsync(CancellationToken cancellationToken = default)
@@ -35,12 +31,25 @@ public sealed class TranslinkMapClient : ITransitMapClient
 
     public Task<PTDLineSnapshot> GetLineSnapshotAsync(string lineId, CancellationToken cancellationToken = default)
     {
-        if (lineId.StartsWith(ShortNameContainsPrefix, StringComparison.OrdinalIgnoreCase))
+        var shortNameAnyParts = TranslinkRailLineCatalog.GetShortNameAnyParts(lineId);
+        if (shortNameAnyParts.Length > 0)
         {
-            return client.GetLineSnapshotByShortNameContainsAsync(lineId[ShortNameContainsPrefix.Length..], cancellationToken);
+            return WithCatalogLineAsync(client.GetLineSnapshotByShortNameAnyAsync(shortNameAnyParts, cancellationToken));
         }
 
-        return client.GetLineSnapshotAsync(lineId, cancellationToken);
+        if (lineId.StartsWith(TranslinkRailLineCatalog.ShortNameContainsPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return WithCatalogLineAsync(client.GetLineSnapshotByShortNameContainsAsync(lineId[TranslinkRailLineCatalog.ShortNameContainsPrefix.Length..], cancellationToken));
+        }
+
+        return WithCatalogLineAsync(client.GetLineSnapshotAsync(lineId, cancellationToken));
+    }
+
+    private static async Task<PTDLineSnapshot> WithCatalogLineAsync(Task<PTDLineSnapshot> snapshotTask)
+    {
+        var snapshot = await snapshotTask.ConfigureAwait(false);
+        var catalogLine = TranslinkRailLineCatalog.FindLine(snapshot.Line.Id);
+        return catalogLine is null ? snapshot : snapshot with { Line = catalogLine };
     }
 
     public Task<PTDStationSnapshot> GetStationSnapshotAsync(string stationId, CancellationToken cancellationToken = default)

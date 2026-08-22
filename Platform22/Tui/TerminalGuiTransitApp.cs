@@ -35,6 +35,9 @@ public sealed class TerminalGuiTransitApp
     private DateTimeOffset nextUpdateAt;
     private bool updatingSelector;
     private int refreshInProgress;
+    private readonly object renderedSnapshotLock = new();
+    private readonly Dictionary<string, string> renderedSnapshots = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> loadingSnapshots = new(StringComparer.OrdinalIgnoreCase);
 
     public TerminalGuiTransitApp(IReadOnlyList<TransitProviderOption> providers, TransitProviderOption initialProvider)
     {
@@ -44,7 +47,8 @@ public sealed class TerminalGuiTransitApp
 
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
-        await LoadCurrentProviderAsync(cancellationToken).ConfigureAwait(false);
+        await Task.CompletedTask.ConfigureAwait(false);
+        loadingProvider = true;
 
         Application.Init();
         try
@@ -120,6 +124,7 @@ public sealed class TerminalGuiTransitApp
             top.Add(menuBar, window);
             window.SetFocus();
             ScheduleNextUpdate();
+            RefreshData();
             Refresh();
             repaintTimer = new Timer(_ => InvokeRefresh(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
             dataRefreshTimer = new Timer(_ => RefreshData(), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
@@ -348,8 +353,20 @@ public sealed class TerminalGuiTransitApp
 
     private string RenderSelectedLine(string lineId)
     {
-        var snapshot = client.GetLineSnapshotAsync(lineId).GetAwaiter().GetResult();
-        return renderer.RenderLine(snapshot, zoom, 28);
+        var cacheKey = $"line:{client.Name}:{lineId}:z{zoom}";
+        lock (renderedSnapshotLock)
+        {
+            if (renderedSnapshots.TryGetValue(cacheKey, out var rendered))
+            {
+                return rendered;
+            }
+        }
+
+        BeginLoadSnapshot(cacheKey, async () => renderer.RenderLine(await client.GetLineSnapshotAsync(lineId).ConfigureAwait(false), zoom, 28));
+        lock (renderedSnapshotLock)
+        {
+            return loadingSnapshots.Contains(cacheKey) ? "Loading line snapshot..." : "Line snapshot queued...";
+        }
     }
 
     private Color GetLineColor(string lineId)
@@ -404,8 +421,61 @@ public sealed class TerminalGuiTransitApp
 
     private string RenderSelectedStation(string stationId)
     {
-        var snapshot = client.GetStationSnapshotAsync(stationId).GetAwaiter().GetResult();
-        return renderer.RenderStation(snapshot, zoom, 24);
+        var cacheKey = $"station:{client.Name}:{stationId}:z{zoom}";
+        lock (renderedSnapshotLock)
+        {
+            if (renderedSnapshots.TryGetValue(cacheKey, out var rendered))
+            {
+                return rendered;
+            }
+        }
+
+        BeginLoadSnapshot(cacheKey, async () => renderer.RenderStation(await client.GetStationSnapshotAsync(stationId).ConfigureAwait(false), zoom, 24));
+        lock (renderedSnapshotLock)
+        {
+            return loadingSnapshots.Contains(cacheKey) ? "Loading station snapshot..." : "Station snapshot queued...";
+        }
+    }
+
+    private void BeginLoadSnapshot(string cacheKey, Func<Task<string>> renderAsync)
+    {
+        lock (renderedSnapshotLock)
+        {
+            if (!loadingSnapshots.Add(cacheKey))
+            {
+                return;
+            }
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var rendered = await renderAsync().ConfigureAwait(false);
+                lock (renderedSnapshotLock)
+                {
+                    renderedSnapshots[cacheKey] = rendered;
+                }
+                loadError = null;
+            }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine(exception);
+                lock (renderedSnapshotLock)
+                {
+                    renderedSnapshots[cacheKey] = exception.Message;
+                }
+                loadError = exception.Message;
+            }
+            finally
+            {
+                lock (renderedSnapshotLock)
+                {
+                    loadingSnapshots.Remove(cacheKey);
+                }
+                InvokeRefresh();
+            }
+        });
     }
 
     private void RefreshData()
@@ -417,6 +487,11 @@ public sealed class TerminalGuiTransitApp
 
         loadingProvider = true;
         loadError = null;
+        lock (renderedSnapshotLock)
+        {
+            renderedSnapshots.Clear();
+            loadingSnapshots.Clear();
+        }
         InvokeRefresh();
 
         _ = Task.Run(async () =>
