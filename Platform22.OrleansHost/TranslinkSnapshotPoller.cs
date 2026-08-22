@@ -56,6 +56,7 @@ public sealed class TranslinkSnapshotPoller : BackgroundService
                 .ConfigureAwait(false);
 
             await MarkPrewarmDoneAsync().ConfigureAwait(false);
+            await MarkPollOwnerAsync().ConfigureAwait(false);
 
             Console.Error.WriteLine($"Translink static GTFS prewarm completed in {stopwatch.ElapsedMilliseconds} ms");
         }
@@ -80,11 +81,6 @@ public sealed class TranslinkSnapshotPoller : BackgroundService
 
             var grainFactory = services.GetRequiredService<IGrainFactory>();
 
-            var stations = await provider.GetStationsAsync(cancellationToken).ConfigureAwait(false);
-            await grainFactory.GetGrain<IStationDirectoryGrain>("translink")
-                .SetStationsJsonAsync(JsonSerializer.Serialize(new StationDirectoryCache(stations, DateTimeOffset.UtcNow)))
-                .ConfigureAwait(false);
-
             foreach (var line in TranslinkRailLineDefinitions.Lines)
             {
                 var lineStopwatch = Stopwatch.StartNew();
@@ -98,6 +94,7 @@ public sealed class TranslinkSnapshotPoller : BackgroundService
 
             Console.Error.WriteLine($"Translink poll completed in {stopwatch.ElapsedMilliseconds} ms");
             logger.LogInformation("Translink poll completed in {ElapsedMs} ms", stopwatch.ElapsedMilliseconds);
+            await MarkPollOwnerAsync().ConfigureAwait(false);
             await MarkPollDoneAsync().ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -122,6 +119,11 @@ public sealed class TranslinkSnapshotPoller : BackgroundService
             return false;
         }
 
+        if (!await TryRenewPollOwnerAsync().ConfigureAwait(false))
+        {
+            return false;
+        }
+
         var lastPollValue = await database.StringGetAsync("platform22:translink:last-poll").ConfigureAwait(false);
         if (lastPollValue.HasValue
             && long.TryParse(lastPollValue.ToString(), out var lastPollTicks)
@@ -131,6 +133,29 @@ public sealed class TranslinkSnapshotPoller : BackgroundService
         }
 
         return await TryAcquireLeaseAsync("platform22:translink:poll-lock", TimeSpan.FromSeconds(25)).ConfigureAwait(false);
+    }
+
+    private async Task<bool> TryRenewPollOwnerAsync()
+    {
+        var database = redis.Value?.GetDatabase();
+        if (database is null)
+        {
+            return true;
+        }
+
+        var owner = await database.StringGetAsync("platform22:translink:poll-owner").ConfigureAwait(false);
+        if (!owner.HasValue)
+        {
+            return await database.StringSetAsync("platform22:translink:poll-owner", instanceId, TimeSpan.FromSeconds(90), When.NotExists).ConfigureAwait(false);
+        }
+
+        if (!string.Equals(owner.ToString(), instanceId, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        await database.KeyExpireAsync("platform22:translink:poll-owner", TimeSpan.FromSeconds(90)).ConfigureAwait(false);
+        return true;
     }
 
     private async Task<bool> TryAcquireLeaseAsync(string key, TimeSpan expiry)
@@ -151,6 +176,15 @@ public sealed class TranslinkSnapshotPoller : BackgroundService
         if (database is not null)
         {
             await database.StringSetAsync("platform22:translink:prewarm-done", DateTimeOffset.UtcNow.UtcTicks, TimeSpan.FromHours(6)).ConfigureAwait(false);
+        }
+    }
+
+    private async Task MarkPollOwnerAsync()
+    {
+        var database = redis.Value?.GetDatabase();
+        if (database is not null)
+        {
+            await database.StringSetAsync("platform22:translink:poll-owner", instanceId, TimeSpan.FromSeconds(90)).ConfigureAwait(false);
         }
     }
 

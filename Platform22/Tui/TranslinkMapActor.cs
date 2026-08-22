@@ -6,6 +6,7 @@ using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using global::Orleans.Configuration;
 using PaulsTransitData.Models;
 using PaulsTransitData.Providers.Translink;
 using Platform22.Orleans;
@@ -109,7 +110,7 @@ public sealed class TranslinkMapActor : ITransitMapClient, IAsyncDisposable
         {
             if (externalOrleans)
             {
-                throw new InvalidOperationException("Translink cache is warming. Try again shortly.");
+                throw new TranslinkCacheWarmingException();
             }
 
             var snapshot = WithCatalogLine(await FetchLineSnapshotAsync(lineId, cancellationToken).ConfigureAwait(false));
@@ -130,7 +131,7 @@ public sealed class TranslinkMapActor : ITransitMapClient, IAsyncDisposable
         {
             if (externalOrleans)
             {
-                throw new InvalidOperationException("Translink cache is warming. Try again shortly.");
+                throw new TranslinkCacheWarmingException();
             }
 
             var snapshot = await GetProviderClient().GetStationSnapshotAsync(stationId, cancellationToken).ConfigureAwait(false);
@@ -198,6 +199,7 @@ public sealed class TranslinkMapActor : ITransitMapClient, IAsyncDisposable
             {
                 silo.UseLocalhostClustering(siloPort, gatewayPort);
                 silo.AddMemoryGrainStorage("Default");
+                silo.Configure<ClusterOptions>(options => options.ClusterId = GetClusterId());
             })
             .Build();
 
@@ -225,36 +227,38 @@ public sealed class TranslinkMapActor : ITransitMapClient, IAsyncDisposable
                     client.UseRedisClustering(options =>
                     {
                         options.ConfigurationOptions = StackExchange.Redis.ConfigurationOptions.Parse(valkeyConnectionString);
-                        options.EntryExpiry = TimeSpan.FromSeconds(30);
                     });
-                    return;
-                }
-
-                var gatewayHost = Environment.GetEnvironmentVariable("ORLEANS_GATEWAY_HOST");
-                var gatewayPort = GetPort("ORLEANS_GATEWAY_PORT", 30000);
-                if (Uri.TryCreate(gatewayHost, UriKind.Absolute, out var gatewayUri))
-                {
-                    gatewayHost = gatewayUri.Host;
-                    if (!gatewayUri.IsDefaultPort)
-                    {
-                        gatewayPort = gatewayUri.Port;
-                    }
-                }
-
-                if (string.IsNullOrWhiteSpace(gatewayHost) || string.Equals(gatewayHost, "localhost", StringComparison.OrdinalIgnoreCase))
-                {
-                    client.UseLocalhostClustering(gatewayPort: gatewayPort);
                 }
                 else
                 {
-                    var addresses = Dns.GetHostAddresses(gatewayHost);
-                    if (addresses.Length == 0)
+                    var gatewayHost = Environment.GetEnvironmentVariable("ORLEANS_GATEWAY_HOST");
+                    var gatewayPort = GetPort("ORLEANS_GATEWAY_PORT", 30000);
+                    if (Uri.TryCreate(gatewayHost, UriKind.Absolute, out var gatewayUri))
                     {
-                        throw new InvalidOperationException($"Cannot resolve Orleans gateway host '{gatewayHost}'.");
+                        gatewayHost = gatewayUri.Host;
+                        if (!gatewayUri.IsDefaultPort)
+                        {
+                            gatewayPort = gatewayUri.Port;
+                        }
                     }
 
-                    client.UseStaticClustering(new IPEndPoint(addresses[0], gatewayPort));
+                    if (string.IsNullOrWhiteSpace(gatewayHost) || string.Equals(gatewayHost, "localhost", StringComparison.OrdinalIgnoreCase))
+                    {
+                        client.UseLocalhostClustering(gatewayPort: gatewayPort);
+                    }
+                    else
+                    {
+                        var addresses = Dns.GetHostAddresses(gatewayHost);
+                        if (addresses.Length == 0)
+                        {
+                            throw new InvalidOperationException($"Cannot resolve Orleans gateway host '{gatewayHost}'.");
+                        }
+
+                        client.UseStaticClustering(new IPEndPoint(addresses[0], gatewayPort));
+                    }
                 }
+
+                client.Configure<ClusterOptions>(options => options.ClusterId = GetClusterId());
             })
             .Build();
 
@@ -279,6 +283,11 @@ public sealed class TranslinkMapActor : ITransitMapClient, IAsyncDisposable
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
         listener.Stop();
         return port;
+    }
+
+    private static string GetClusterId()
+    {
+        return Environment.GetEnvironmentVariable("ORLEANS_CLUSTER_ID") ?? "platform22";
     }
 
     private static bool TryReadDirectory(string? json, out IReadOnlyList<PTDStationSummary> stations, out DateTimeOffset updatedAt)
@@ -314,4 +323,12 @@ public sealed class TranslinkMapActor : ITransitMapClient, IAsyncDisposable
     }
 
     private sealed record StationDirectoryCache(IReadOnlyList<PTDStationSummary> Stations, DateTimeOffset UpdatedAt);
+}
+
+public sealed class TranslinkCacheWarmingException : Exception
+{
+    public TranslinkCacheWarmingException()
+        : base("Translink cache is warming.")
+    {
+    }
 }

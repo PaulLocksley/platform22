@@ -38,6 +38,7 @@ public sealed class TerminalGuiTransitApp
     private readonly object renderedSnapshotLock = new();
     private readonly Dictionary<string, string> renderedSnapshots = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> loadingSnapshots = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTimeOffset> snapshotRetryAfter = new(StringComparer.OrdinalIgnoreCase);
 
     public TerminalGuiTransitApp(IReadOnlyList<TransitProviderOption> providers, TransitProviderOption initialProvider)
     {
@@ -106,6 +107,7 @@ public sealed class TerminalGuiTransitApp
 
                 selectedIndex = args.Item;
                 selectedItemId = null;
+                panX = 0;
                 panY = 0;
                 Refresh();
             };
@@ -224,11 +226,13 @@ public sealed class TerminalGuiTransitApp
             case Key.CursorDown:
                 selectedIndex++;
                 selectedItemId = null;
+                panX = 0;
                 panY = 0;
                 break;
             case Key.CursorUp:
                 selectedIndex = Math.Max(0, selectedIndex - 1);
                 selectedItemId = null;
+                panX = 0;
                 panY = 0;
                 break;
             default:
@@ -311,7 +315,8 @@ public sealed class TerminalGuiTransitApp
 
         var filterMode = filterEditing ? "FILTER" : "MAP";
         header.Text = $"{client.Name} | {mode} | {filterMode} | filter: {filter} | selected: {items[selectedIndex].Name} | {selectedIndex + 1}/{items.Count}";
-        mapView.Text = ApplyViewport(rendered);
+        var viewportText = ApplyViewport(rendered);
+        mapView.Text = string.IsNullOrWhiteSpace(viewportText) ? LoadingText("Loading map") : viewportText;
         mapView.LineColor = mode == TransitTuiMode.Lines ? GetLineColor(items[selectedIndex].Id) : Color.BrightGreen;
         UpdateSelector(items);
         status.Text = GetStatusText(loadError ?? GetTooltip(items[selectedIndex]));
@@ -360,12 +365,19 @@ public sealed class TerminalGuiTransitApp
             {
                 return rendered;
             }
+
+            if (snapshotRetryAfter.TryGetValue(cacheKey, out var retryAfter) && retryAfter > DateTimeOffset.UtcNow)
+            {
+                return LoadingText("Loading line snapshot");
+            }
         }
 
-        BeginLoadSnapshot(cacheKey, async () => renderer.RenderLine(await client.GetLineSnapshotAsync(lineId).ConfigureAwait(false), zoom, 28));
+        var renderWidth = Math.Max(zoom, mapView?.Frame.Width - 2 ?? zoom);
+        var renderHeight = Math.Max(28, mapView?.Frame.Height - 4 ?? 28);
+        BeginLoadSnapshot(cacheKey, async () => renderer.RenderLine(await client.GetLineSnapshotAsync(lineId).ConfigureAwait(false), renderWidth, renderHeight));
         lock (renderedSnapshotLock)
         {
-            return loadingSnapshots.Contains(cacheKey) ? "Loading line snapshot..." : "Line snapshot queued...";
+            return loadingSnapshots.Contains(cacheKey) ? LoadingText("Loading line snapshot") : "Line snapshot queued...";
         }
     }
 
@@ -428,12 +440,19 @@ public sealed class TerminalGuiTransitApp
             {
                 return rendered;
             }
+
+            if (snapshotRetryAfter.TryGetValue(cacheKey, out var retryAfter) && retryAfter > DateTimeOffset.UtcNow)
+            {
+                return LoadingText("Loading station snapshot");
+            }
         }
 
-        BeginLoadSnapshot(cacheKey, async () => renderer.RenderStation(await client.GetStationSnapshotAsync(stationId).ConfigureAwait(false), zoom, 24));
+        var renderWidth = Math.Max(zoom, mapView?.Frame.Width - 2 ?? zoom);
+        var renderHeight = Math.Max(24, mapView?.Frame.Height - 4 ?? 24);
+        BeginLoadSnapshot(cacheKey, async () => renderer.RenderStation(await client.GetStationSnapshotAsync(stationId).ConfigureAwait(false), renderWidth, renderHeight));
         lock (renderedSnapshotLock)
         {
-            return loadingSnapshots.Contains(cacheKey) ? "Loading station snapshot..." : "Station snapshot queued...";
+            return loadingSnapshots.Contains(cacheKey) ? LoadingText("Loading station snapshot") : "Station snapshot queued...";
         }
     }
 
@@ -455,17 +474,29 @@ public sealed class TerminalGuiTransitApp
                 lock (renderedSnapshotLock)
                 {
                     renderedSnapshots[cacheKey] = rendered;
+                    snapshotRetryAfter.Remove(cacheKey);
                 }
                 loadError = null;
             }
             catch (Exception exception)
             {
-                Console.Error.WriteLine(exception);
-                lock (renderedSnapshotLock)
+                if (exception is TranslinkCacheWarmingException)
                 {
-                    renderedSnapshots[cacheKey] = exception.Message;
+                    lock (renderedSnapshotLock)
+                    {
+                        snapshotRetryAfter[cacheKey] = DateTimeOffset.UtcNow.AddSeconds(2);
+                    }
                 }
-                loadError = exception.Message;
+                else
+                {
+                    Console.Error.WriteLine(exception);
+                    lock (renderedSnapshotLock)
+                    {
+                        renderedSnapshots[cacheKey] = exception.Message;
+                    }
+
+                    loadError = exception.Message;
+                }
             }
             finally
             {
@@ -491,6 +522,7 @@ public sealed class TerminalGuiTransitApp
         {
             renderedSnapshots.Clear();
             loadingSnapshots.Clear();
+            snapshotRetryAfter.Clear();
         }
         InvokeRefresh();
 
@@ -542,6 +574,13 @@ public sealed class TerminalGuiTransitApp
         panY = 0;
         loadingProvider = true;
         loadError = null;
+        lock (renderedSnapshotLock)
+        {
+            renderedSnapshots.Clear();
+            loadingSnapshots.Clear();
+            snapshotRetryAfter.Clear();
+        }
+
         Refresh();
         _ = Task.Run(async () =>
         {
@@ -728,6 +767,12 @@ public sealed class TerminalGuiTransitApp
 
     private string ApplyViewport(string text)
     {
+        var maxLineLength = text.Split(Environment.NewLine).DefaultIfEmpty(string.Empty).Max(line => line.Length);
+        if (panX > maxLineLength)
+        {
+            panX = 0;
+        }
+
         var builder = new StringBuilder();
         foreach (var line in text.Split(Environment.NewLine).Skip(panY))
         {
@@ -769,6 +814,13 @@ public sealed class TerminalGuiTransitApp
         }
 
         return $"{lastText}  next: {remaining:mm\\:ss}";
+    }
+
+    private static string LoadingText(string text)
+    {
+        ReadOnlySpan<char> frames = ['|', '/', '-', '\\'];
+        var frame = frames[(int)(DateTimeOffset.UtcNow.ToUnixTimeSeconds() % frames.Length)];
+        return $"{text} {frame}";
     }
 
     private sealed record MapItem(string Id, string Name, string Tooltip);

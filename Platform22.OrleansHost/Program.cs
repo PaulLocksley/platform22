@@ -2,6 +2,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Orleans.Configuration;
 using PaulsTransitData.Providers.Translink;
 using Platform22.OrleansHost;
 
@@ -24,7 +25,6 @@ builder.UseOrleans(silo =>
         silo.UseRedisClustering(options =>
         {
             options.ConfigurationOptions = StackExchange.Redis.ConfigurationOptions.Parse(valkeyConnectionString);
-            options.EntryExpiry = TimeSpan.FromSeconds(30);
         });
     }
     else
@@ -33,6 +33,7 @@ builder.UseOrleans(silo =>
     }
 
     silo.AddMemoryGrainStorage("Default");
+    silo.Configure<ClusterOptions>(options => options.ClusterId = GetClusterId());
 });
 
 await builder.Build().RunAsync();
@@ -40,4 +41,9 @@ await builder.Build().RunAsync();
 static int GetPort(string name, int defaultValue)
 {
     return int.TryParse(Environment.GetEnvironmentVariable(name), out var port) ? port : defaultValue;
+}
+
+static string GetClusterId()
+{
+    return Environment.GetEnvironmentVariable("ORLEANS_CLUSTER_ID") ?? "platform22";
 }

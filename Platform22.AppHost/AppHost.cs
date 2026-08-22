@@ -2,8 +2,10 @@ var builder = DistributedApplication.CreateBuilder(args);
 
 var k8s = builder.AddKubernetesEnvironment("k8s");
 var valkey = builder.AddValkey("valkey");
+const string orleansClusterId = "platform22";
 var orleansHost = builder.AddProject<Projects.Platform22_OrleansHost>("orleans-host")
     .WithComputeEnvironment(k8s)
+    .WithEnvironment("ORLEANS_CLUSTER_ID", orleansClusterId)
     .WithEnvironment("ORLEANS_SILO_PORT", "11111")
     .WithEnvironment("ORLEANS_GATEWAY_PORT", "30000")
     .WithEndpoint(targetPort: 11111, name: "silo", scheme: "tcp", isProxied: false)
@@ -15,6 +17,7 @@ var orleansHost2 = builder.ExecutionContext.IsRunMode
     ? builder.AddProject<Projects.Platform22_OrleansHost>("orleans-host-2")
         .WithEnvironment("ORLEANS_SILO_PORT", "11112")
         .WithEnvironment("ORLEANS_GATEWAY_PORT", "30001")
+        .WithEnvironment("ORLEANS_CLUSTER_ID", orleansClusterId)
         .WithEndpoint(targetPort: 11112, name: "silo", scheme: "tcp", isProxied: false)
         .WithEndpoint(targetPort: 30001, name: "gateway", scheme: "tcp", isProxied: false)
         .WithReference(valkey)
@@ -29,6 +32,7 @@ var platform22 = builder.AddProject<Projects.Platform22>("platform22")
     .WithEnvironment("PLATFORM22_SSH_PORT", "2222")
     .WithEnvironment("ORLEANS_GATEWAY_HOST", orleansHost.GetEndpoint("gateway"))
     .WithEnvironment("ORLEANS_GATEWAY_PORT", "30000")
+    .WithEnvironment("ORLEANS_CLUSTER_ID", orleansClusterId)
     .WithEndpoint(targetPort: 2222, name: "ssh", scheme: "tcp", isProxied: false)
     .WaitFor(valkey)
     .WaitFor(orleansHost);
@@ -45,6 +49,7 @@ var platform22Node2 = builder.AddProject<Projects.Platform22>("platform22-node-2
     .WithEnvironment("PLATFORM22_SSH_PORT", "2223")
     .WithEnvironment("ORLEANS_GATEWAY_HOST", orleansHost.GetEndpoint("gateway"))
     .WithEnvironment("ORLEANS_GATEWAY_PORT", "30000")
+    .WithEnvironment("ORLEANS_CLUSTER_ID", orleansClusterId)
     .WithEndpoint(targetPort: 2223, name: "ssh", scheme: "tcp", isProxied: false)
     .WaitFor(valkey)
     .WaitFor(orleansHost);
