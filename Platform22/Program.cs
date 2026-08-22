@@ -1,9 +1,7 @@
-using Platform22;
 using Platform22.Tui;
 using PaulsTransitData.Providers.Mock;
 using PaulsTransitData.Providers.Translink;
 
-using var healthProbe = HealthProbeServer.StartFromEnvironment();
 using var translinkHttpClient = new HttpClient
 {
     Timeout = TimeSpan.FromSeconds(15)
