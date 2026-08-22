@@ -10,10 +10,11 @@ using PaulsTransitData.Models;
 using PaulsTransitData.Providers.Translink;
 using Platform22.Orleans;
 
-public sealed class TranslinkMapActor : IAsyncDisposable
+public sealed class TranslinkMapActor : ITransitMapClient, IAsyncDisposable
 {
     private const string ShortNameContainsPrefix = "translink:short-name-contains:";
     private const string DirectoryKey = "translink";
+    private static readonly TimeSpan SharedRefreshInterval = TimeSpan.FromSeconds(25);
     private readonly TranslinkPTDClient providerClient;
     private readonly HashSet<string> knownLineIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> knownStationIds = new(StringComparer.OrdinalIgnoreCase);
@@ -37,15 +38,25 @@ public sealed class TranslinkMapActor : IAsyncDisposable
         }
     }
 
+    public string Name => "Translink";
+
     public async Task RefreshAsync(CancellationToken cancellationToken = default)
     {
         await refreshLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             var client = await GetClusterClientAsync().ConfigureAwait(false);
+            var directoryGrain = client.GetGrain<IStationDirectoryGrain>(DirectoryKey);
+            var existingDirectoryJson = await directoryGrain.GetStationsJsonAsync().ConfigureAwait(false);
+            if (TryReadDirectory(existingDirectoryJson, out _, out var updatedAt)
+                && DateTimeOffset.UtcNow - updatedAt < SharedRefreshInterval)
+            {
+                return;
+            }
+
             var stations = await providerClient.GetStationsAsync(cancellationToken).ConfigureAwait(false);
-            await client.GetGrain<IStationDirectoryGrain>(DirectoryKey)
-                .SetStationsJsonAsync(JsonSerializer.Serialize(stations))
+            await directoryGrain
+                .SetStationsJsonAsync(JsonSerializer.Serialize(new StationDirectoryCache(stations, DateTimeOffset.UtcNow)))
                 .ConfigureAwait(false);
 
             foreach (var lineId in knownLineIds.ToArray())
@@ -70,14 +81,22 @@ public sealed class TranslinkMapActor : IAsyncDisposable
         }
     }
 
-    public async Task<IReadOnlyList<PTDStationSummary>> GetStationsAsync()
+    public Task<IReadOnlyList<PTDLineSummary>> GetLinesAsync(CancellationToken cancellationToken = default)
+    {
+        return Task.FromResult<IReadOnlyList<PTDLineSummary>>(
+        [
+            new PTDLineSummary("translink:short-name-contains:VL", "Varsity Lakes services", "translink", "FFC425")
+        ]);
+    }
+
+    public async Task<IReadOnlyList<PTDStationSummary>> GetStationsAsync(CancellationToken cancellationToken = default)
     {
         var client = await GetClusterClientAsync().ConfigureAwait(false);
         var json = await client.GetGrain<IStationDirectoryGrain>(DirectoryKey).GetStationsJsonAsync().ConfigureAwait(false);
-        return json is null ? [] : JsonSerializer.Deserialize<PTDStationSummary[]>(json) ?? [];
+        return TryReadDirectory(json, out var stations, out _) ? stations : [];
     }
 
-    public async Task<PTDLineSnapshot> GetLineSnapshotAsync(string lineId)
+    public async Task<PTDLineSnapshot> GetLineSnapshotAsync(string lineId, CancellationToken cancellationToken = default)
     {
         knownLineIds.Add(lineId);
         var client = await GetClusterClientAsync().ConfigureAwait(false);
@@ -85,7 +104,7 @@ public sealed class TranslinkMapActor : IAsyncDisposable
         var json = await grain.GetSnapshotJsonAsync().ConfigureAwait(false);
         if (json is null)
         {
-            var snapshot = await FetchLineSnapshotAsync(lineId, CancellationToken.None).ConfigureAwait(false);
+            var snapshot = await FetchLineSnapshotAsync(lineId, cancellationToken).ConfigureAwait(false);
             json = JsonSerializer.Serialize(snapshot);
             await grain.SetSnapshotJsonAsync(json).ConfigureAwait(false);
         }
@@ -93,7 +112,7 @@ public sealed class TranslinkMapActor : IAsyncDisposable
         return JsonSerializer.Deserialize<PTDLineSnapshot>(json)!;
     }
 
-    public async Task<PTDStationSnapshot> GetStationSnapshotAsync(string stationId)
+    public async Task<PTDStationSnapshot> GetStationSnapshotAsync(string stationId, CancellationToken cancellationToken = default)
     {
         knownStationIds.Add(stationId);
         var client = await GetClusterClientAsync().ConfigureAwait(false);
@@ -101,7 +120,7 @@ public sealed class TranslinkMapActor : IAsyncDisposable
         var json = await grain.GetSnapshotJsonAsync().ConfigureAwait(false);
         if (json is null)
         {
-            var snapshot = await providerClient.GetStationSnapshotAsync(stationId).ConfigureAwait(false);
+            var snapshot = await providerClient.GetStationSnapshotAsync(stationId, cancellationToken).ConfigureAwait(false);
             json = JsonSerializer.Serialize(snapshot);
             await grain.SetSnapshotJsonAsync(json).ConfigureAwait(false);
         }
@@ -168,7 +187,31 @@ public sealed class TranslinkMapActor : IAsyncDisposable
             .ConfigureLogging(logging => logging.ClearProviders())
             .UseOrleansClient(client =>
             {
-                client.UseLocalhostClustering(gatewayPort: GetPort("ORLEANS_GATEWAY_PORT", 30000));
+                var gatewayHost = Environment.GetEnvironmentVariable("ORLEANS_GATEWAY_HOST");
+                var gatewayPort = GetPort("ORLEANS_GATEWAY_PORT", 30000);
+                if (Uri.TryCreate(gatewayHost, UriKind.Absolute, out var gatewayUri))
+                {
+                    gatewayHost = gatewayUri.Host;
+                    if (!gatewayUri.IsDefaultPort)
+                    {
+                        gatewayPort = gatewayUri.Port;
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(gatewayHost) || string.Equals(gatewayHost, "localhost", StringComparison.OrdinalIgnoreCase))
+                {
+                    client.UseLocalhostClustering(gatewayPort: gatewayPort);
+                }
+                else
+                {
+                    var addresses = Dns.GetHostAddresses(gatewayHost);
+                    if (addresses.Length == 0)
+                    {
+                        throw new InvalidOperationException($"Cannot resolve Orleans gateway host '{gatewayHost}'.");
+                    }
+
+                    client.UseStaticClustering(new IPEndPoint(addresses[0], gatewayPort));
+                }
             })
             .Build();
 
@@ -194,4 +237,38 @@ public sealed class TranslinkMapActor : IAsyncDisposable
         listener.Stop();
         return port;
     }
+
+    private static bool TryReadDirectory(string? json, out IReadOnlyList<PTDStationSummary> stations, out DateTimeOffset updatedAt)
+    {
+        stations = [];
+        updatedAt = DateTimeOffset.MinValue;
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return false;
+        }
+
+        try
+        {
+            var cache = JsonSerializer.Deserialize<StationDirectoryCache>(json);
+            if (cache is not null)
+            {
+                stations = cache.Stations;
+                updatedAt = cache.UpdatedAt;
+                return true;
+            }
+        }
+        catch (JsonException)
+        {
+            var legacyStations = JsonSerializer.Deserialize<PTDStationSummary[]>(json);
+            if (legacyStations is not null)
+            {
+                stations = legacyStations;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private sealed record StationDirectoryCache(IReadOnlyList<PTDStationSummary> Stations, DateTimeOffset UpdatedAt);
 }

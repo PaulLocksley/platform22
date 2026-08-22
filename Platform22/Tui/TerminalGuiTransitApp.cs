@@ -31,7 +31,10 @@ public sealed class TerminalGuiTransitApp
     private Window? pickerWindow;
     private Timer? repaintTimer;
     private Timer? dataRefreshTimer;
+    private DateTimeOffset? lastUpdatedAt;
+    private DateTimeOffset nextUpdateAt;
     private bool updatingSelector;
+    private int refreshInProgress;
 
     public TerminalGuiTransitApp(IReadOnlyList<TransitProviderOption> providers, TransitProviderOption initialProvider)
     {
@@ -109,23 +112,14 @@ public sealed class TerminalGuiTransitApp
                 HandleKey(args.KeyEvent);
                 args.Handled = true;
             };
-            window.KeyDown += args =>
-            {
-                HandleKey(args.KeyEvent);
-                args.Handled = true;
-            };
             top.KeyPress += args =>
-            {
-                HandleKey(args.KeyEvent);
-                args.Handled = true;
-            };
-            top.KeyDown += args =>
             {
                 HandleKey(args.KeyEvent);
                 args.Handled = true;
             };
             top.Add(menuBar, window);
             window.SetFocus();
+            ScheduleNextUpdate();
             Refresh();
             repaintTimer = new Timer(_ => InvokeRefresh(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
             dataRefreshTimer = new Timer(_ => RefreshData(), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
@@ -283,7 +277,7 @@ public sealed class TerminalGuiTransitApp
                 : $"{client.Name} | {mode} | filter: {filter} | no matches";
             mapView.Text = string.Empty;
             UpdateSelector([]);
-            status.Text = loadError ?? "Type to filter, Tab switch, q quit";
+            status.Text = GetStatusText(loadError ?? "Type to filter, Tab switch, q quit");
             return;
         }
 
@@ -315,7 +309,7 @@ public sealed class TerminalGuiTransitApp
         mapView.Text = ApplyViewport(rendered);
         mapView.LineColor = mode == TransitTuiMode.Lines ? GetLineColor(items[selectedIndex].Id) : Color.BrightGreen;
         UpdateSelector(items);
-        status.Text = GetTooltip(items[selectedIndex]);
+        status.Text = GetStatusText(loadError ?? GetTooltip(items[selectedIndex]));
     }
 
     private void UpdateSelector(IReadOnlyList<MapItem> items)
@@ -416,19 +410,32 @@ public sealed class TerminalGuiTransitApp
 
     private void RefreshData()
     {
+        if (Interlocked.Exchange(ref refreshInProgress, 1) == 1)
+        {
+            return;
+        }
+
+        loadingProvider = true;
+        loadError = null;
+        InvokeRefresh();
+
         _ = Task.Run(async () =>
         {
-            await client.RefreshAsync().ConfigureAwait(false);
-            lines = await client.GetLinesAsync().ConfigureAwait(false);
-            stations = await client.GetStationsAsync().ConfigureAwait(false);
-            Application.MainLoop?.Invoke(() =>
+            try
             {
-                if (menuBar is not null)
-                {
-                    menuBar.Menus = CreateMenuBar().Menus;
-                }
-            });
-            InvokeRefresh();
+                await LoadCurrentProviderAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine(exception);
+                loadError = $"Refresh failed: {exception.Message}";
+            }
+            finally
+            {
+                loadingProvider = false;
+                Interlocked.Exchange(ref refreshInProgress, 0);
+                InvokeRefresh();
+            }
         });
     }
 
@@ -485,6 +492,8 @@ public sealed class TerminalGuiTransitApp
         await client.RefreshAsync(cancellationToken).ConfigureAwait(false);
         lines = await client.GetLinesAsync(cancellationToken).ConfigureAwait(false);
         stations = await client.GetStationsAsync(cancellationToken).ConfigureAwait(false);
+        lastUpdatedAt = DateTimeOffset.Now;
+        ScheduleNextUpdate();
         Application.MainLoop?.Invoke(() =>
         {
             if (menuBar is not null)
@@ -656,6 +665,35 @@ public sealed class TerminalGuiTransitApp
     private static string GetTooltip(MapItem item)
     {
         return $"Right panel scrolls | L/S menus | / filter | hjkl pan | +/- zoom | Up/Down select | r refresh | Tab mode | q quit | tooltip: {item.Tooltip}";
+    }
+
+    private void ScheduleNextUpdate()
+    {
+        nextUpdateAt = DateTimeOffset.Now.AddSeconds(30);
+    }
+
+    private string GetStatusText(string leftText)
+    {
+        var updateText = GetUpdateText();
+        var width = status?.Frame.Width ?? 0;
+        if (width <= 0 || leftText.Length + updateText.Length + 2 >= width)
+        {
+            return $"{leftText} | {updateText}";
+        }
+
+        return leftText + new string(' ', width - leftText.Length - updateText.Length) + updateText;
+    }
+
+    private string GetUpdateText()
+    {
+        var lastText = lastUpdatedAt is null ? "last: never" : $"last: {lastUpdatedAt:HH:mm:ss}";
+        var remaining = nextUpdateAt - DateTimeOffset.Now;
+        if (remaining < TimeSpan.Zero)
+        {
+            remaining = TimeSpan.Zero;
+        }
+
+        return $"{lastText}  next: {remaining:mm\\:ss}";
     }
 
     private sealed record MapItem(string Id, string Name, string Tooltip);

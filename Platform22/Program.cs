@@ -1,11 +1,18 @@
+using Platform22;
 using Platform22.Tui;
 using PaulsTransitData.Providers.Mock;
 using PaulsTransitData.Providers.Translink;
 
+using var healthProbe = HealthProbeServer.StartFromEnvironment();
+using var translinkHttpClient = new HttpClient
+{
+    Timeout = TimeSpan.FromSeconds(15)
+};
+
 var providers = new[]
 {
     new TransitProviderOption("Mock", new MockMapClient(new MockPTDClient())),
-    new TransitProviderOption("Translink", new TranslinkMapClient(new TranslinkPTDClient(new HttpClient())))
+    new TransitProviderOption("Translink", new TranslinkMapActor(new TranslinkPTDClient(translinkHttpClient)))
 };
 var initialProvider = args.Contains("--translink", StringComparer.OrdinalIgnoreCase) ? providers[1] : providers[0];
 

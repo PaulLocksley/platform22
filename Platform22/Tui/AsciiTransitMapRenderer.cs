@@ -29,6 +29,7 @@ public sealed class AsciiTransitMapRenderer
 
             var marker = GetTrainMarker(train, stopColumns);
             trainRow[column.Value] = trainRow[column.Value] == ' ' ? marker : '+';
+            trackRow[column.Value] = trackRow[column.Value] is '>' or '<' or '+' ? '+' : marker;
         }
 
         var builder = new StringBuilder();

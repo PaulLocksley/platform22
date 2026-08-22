@@ -20,7 +20,10 @@ public sealed class SshTransitHost : IDisposable
         this.providers = providers;
         server = new SshServer(new StartingInfo(IPAddress.Any, port, "SSH-2.0-Platform22"));
         server.AddHostKey("ecdsa-sha2-nistp256", LoadOrCreateHostKey());
-        server.ExceptionRaised += (_, exception) => Console.Error.WriteLine(exception);
+        server.ExceptionRaised += (_, exception) =>
+        {
+            Console.Error.WriteLine(exception);
+        };
         server.ConnectionAccepted += OnConnectionAccepted;
     }
 
@@ -42,6 +45,8 @@ public sealed class SshTransitHost : IDisposable
 
     private void OnConnectionAccepted(object? sender, Session session)
     {
+        ExtendSessionTimeout(session);
+
         session.ServiceRegistered += (_, service) =>
         {
             if (service is UserAuthService userAuthService)
@@ -60,6 +65,12 @@ public sealed class SshTransitHost : IDisposable
                 connectionService.CommandOpened += (_, args) => StartShell(session, args);
             }
         };
+    }
+
+    private static void ExtendSessionTimeout(Session session)
+    {
+        var timeoutField = typeof(Session).GetField("_timeout", BindingFlags.Instance | BindingFlags.NonPublic);
+        timeoutField?.SetValue(session, TimeSpan.FromHours(12));
     }
 
     private static string LoadOrCreateHostKey()
@@ -100,6 +111,12 @@ public sealed class SshTransitHost : IDisposable
         shell.Start(args.CommandText);
     }
 
+    private static bool IsClosedConnectionException(Exception exception)
+    {
+        return exception is NullReferenceException
+            && exception.StackTrace?.Contains("FxSsh.Session.SocketWrite", StringComparison.Ordinal) == true;
+    }
+
     private readonly record struct SshPtySize(uint Columns, uint Rows, string Terminal);
 
     private sealed class SshTuiSession
@@ -108,7 +125,8 @@ public sealed class SshTransitHost : IDisposable
         private readonly Session session;
         private readonly SshPtySize size;
         private Process? process;
-        private bool stopping;
+        private bool sessionClosed;
+        private bool awaitingRestart;
 
         public SshTuiSession(Session session, Channel channel, SshPtySize size)
         {
@@ -119,9 +137,19 @@ public sealed class SshTransitHost : IDisposable
 
         public void Start()
         {
+            channel.DataReceived += (_, data) => OnDataReceived(data.Span);
+            channel.CloseReceived += (_, _) => CloseSessionProcess("channel close received");
+            channel.EofReceived += (_, _) => CloseSessionProcess("channel EOF received");
+            session.Disconnected += (_, _) => CloseSessionProcess("session disconnected");
+
+            StartProcess();
+        }
+
+        private void StartProcess()
+        {
             var assemblyPath = Assembly.GetEntryAssembly()?.Location ?? throw new InvalidOperationException("Cannot locate Platform22 assembly.");
             var command = $"env -u PLATFORM22_SSH_MODE -u PLATFORM22_ORLEANS_MODE -u ORLEANS_GATEWAY_PORT -u ORLEANS_SILO_PORT dotnet {ShellQuote(assemblyPath)}";
-            process = new Process
+            var nextProcess = new Process
             {
                 StartInfo = new ProcessStartInfo
                 {
@@ -133,65 +161,105 @@ public sealed class SshTransitHost : IDisposable
                 },
                 EnableRaisingEvents = true
             };
-            process.StartInfo.ArgumentList.Add("-");
-            process.StartInfo.ArgumentList.Add($"EXEC:{command},pty,setsid,ctty,raw,echo=0");
-            process.StartInfo.Environment["TERM"] = string.IsNullOrWhiteSpace(size.Terminal) ? "xterm-256color" : size.Terminal;
-            process.StartInfo.Environment["COLUMNS"] = Math.Max(40, size.Columns).ToString();
-            process.StartInfo.Environment["LINES"] = Math.Max(10, size.Rows).ToString();
-            process.StartInfo.Environment.Remove("PLATFORM22_SSH_MODE");
-            process.StartInfo.Environment.Remove("PLATFORM22_ORLEANS_MODE");
-            process.StartInfo.Environment.Remove("ORLEANS_GATEWAY_PORT");
-            process.StartInfo.Environment.Remove("ORLEANS_SILO_PORT");
+            nextProcess.StartInfo.ArgumentList.Add("-");
+            nextProcess.StartInfo.ArgumentList.Add($"EXEC:{command},pty,setsid,ctty,raw,echo=0");
+            nextProcess.StartInfo.Environment["TERM"] = string.IsNullOrWhiteSpace(size.Terminal) ? "xterm-256color" : size.Terminal;
+            nextProcess.StartInfo.Environment["COLUMNS"] = Math.Max(40, size.Columns).ToString();
+            nextProcess.StartInfo.Environment["LINES"] = Math.Max(10, size.Rows).ToString();
+            nextProcess.StartInfo.Environment.Remove("PLATFORM22_SSH_MODE");
+            nextProcess.StartInfo.Environment.Remove("PLATFORM22_ORLEANS_MODE");
+            nextProcess.StartInfo.Environment.Remove("ORLEANS_GATEWAY_PORT");
+            nextProcess.StartInfo.Environment.Remove("ORLEANS_SILO_PORT");
 
-            channel.DataReceived += (_, data) =>
-            {
-                try
-                {
-                    if (process is { HasExited: false })
-                    {
-                        process.StandardInput.BaseStream.Write(data.Span);
-                        process.StandardInput.BaseStream.Flush();
-                    }
-                }
-                catch (Exception exception)
-                {
-                    Console.Error.WriteLine(exception);
-                    StopProcess();
-                }
-            };
-            channel.CloseReceived += (_, _) => StopProcess();
-            channel.EofReceived += (_, _) => StopProcess();
-            session.Disconnected += (_, _) => StopProcess();
+            nextProcess.Exited += (_, _) => OnProcessExited(nextProcess);
 
-            process.Exited += (_, _) =>
-            {
-                if (!stopping || process.ExitCode != 137)
-                {
-                    Console.WriteLine($"SSH TUI process exited with code {process.ExitCode}.");
-                }
-
-                TrySendEof();
-                TrySendClose();
-            };
-
-            Console.WriteLine($"Starting SSH TUI process: socat - EXEC:{command},pty,setsid,ctty,raw,echo=0");
             try
             {
-                process.Start();
-                _ = Task.Run(() => CopyToChannelAsync(process.StandardOutput.BaseStream));
-                _ = Task.Run(() => CopyErrorsToLogAsync(process.StandardError));
+                awaitingRestart = false;
+                process = nextProcess;
+                nextProcess.Start();
+                Console.WriteLine($"SSH TUI process started for channel {channel.ServerChannelId} with PID {nextProcess.Id}.");
+                _ = Task.Run(() => CopyToChannelAsync(nextProcess, nextProcess.StandardOutput.BaseStream));
+                _ = Task.Run(() => CopyErrorsToLogAsync(nextProcess.StandardError));
             }
             catch (Exception exception)
             {
-                TrySendData(Encoding.UTF8.GetBytes($"Failed to start TUI: {exception.Message}\r\n"));
-                TrySendClose();
+                // TODO: Send SSH TUI startup failures to Sentry.
+                Console.Error.WriteLine(exception);
+                awaitingRestart = true;
+                TrySendData(Encoding.UTF8.GetBytes($"\r\nFailed to start Platform22 TUI: {exception.Message}\r\nPress r to retry, or q to quit.\r\n"));
             }
         }
 
-        private async Task CopyToChannelAsync(Stream stream)
+        private void OnDataReceived(ReadOnlySpan<byte> data)
+        {
+            if (awaitingRestart)
+            {
+                HandleRestartInput(data);
+                return;
+            }
+
+            try
+            {
+                if (process is { HasExited: false })
+                {
+                    process.StandardInput.BaseStream.Write(data);
+                    process.StandardInput.BaseStream.Flush();
+                }
+            }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine(exception);
+                StopProcess("stdin write failed");
+            }
+        }
+
+        private void HandleRestartInput(ReadOnlySpan<byte> data)
+        {
+            foreach (var value in data)
+            {
+                var character = char.ToLowerInvariant((char)value);
+                if (character == 'q')
+                {
+                    TrySendClose();
+                    return;
+                }
+
+                if (character is 'r' or '\r' or '\n' or ' ')
+                {
+                    TrySendData(Encoding.UTF8.GetBytes("\r\nRestarting Platform22 TUI...\r\n"));
+                    StartProcess();
+                    return;
+                }
+            }
+        }
+
+        private void OnProcessExited(Process exitedProcess)
+        {
+            var exitCode = exitedProcess.ExitCode;
+            var expectedStop = sessionClosed || exitCode == 0;
+            Console.WriteLine($"SSH TUI process {exitedProcess.Id} exited with code {exitCode} for channel {channel.ServerChannelId}; sessionClosed={sessionClosed}.");
+
+            if (expectedStop)
+            {
+                if (!sessionClosed)
+                {
+                    TrySendEof();
+                    TrySendClose();
+                }
+
+                return;
+            }
+
+            // TODO: Send SSH TUI crashes to Sentry.
+            awaitingRestart = true;
+            TrySendData(Encoding.UTF8.GetBytes($"\u001b[?1049l\u001b[0m\u001b[?25h\r\n\r\nPlatform22 TUI crashed with exit code {exitCode}. The SSH session is still open.\r\nPress r or Enter to restart, or q to quit.\r\n"));
+        }
+
+        private async Task CopyToChannelAsync(Process sourceProcess, Stream stream)
         {
             var buffer = new byte[4096];
-            while (process is { HasExited: false })
+            while (!sourceProcess.HasExited)
             {
                 var count = await stream.ReadAsync(buffer).ConfigureAwait(false);
                 if (count == 0)
@@ -201,7 +269,7 @@ public sealed class SshTransitHost : IDisposable
 
                 if (!TrySendData(buffer.AsMemory(0, count)))
                 {
-                    StopProcess();
+                    StopProcess("channel send failed");
                     break;
                 }
             }
@@ -215,13 +283,13 @@ public sealed class SshTransitHost : IDisposable
             }
         }
 
-        private void StopProcess()
+        private void StopProcess(string reason)
         {
             try
             {
                 if (process is { HasExited: false })
                 {
-                    stopping = true;
+                    Console.WriteLine($"Stopping SSH TUI process {process.Id} for channel {channel.ServerChannelId}: {reason}.");
                     process.Kill(entireProcessTree: true);
                 }
             }
@@ -235,8 +303,20 @@ public sealed class SshTransitHost : IDisposable
             }
         }
 
+        private void CloseSessionProcess(string reason)
+        {
+            Console.WriteLine($"Closing SSH TUI session for channel {channel.ServerChannelId}: {reason}.");
+            sessionClosed = true;
+            StopProcess(reason);
+        }
+
         private bool TrySendData(ReadOnlyMemory<byte> data)
         {
+            if (sessionClosed)
+            {
+                return false;
+            }
+
             try
             {
                 channel.SendData(data);
@@ -244,32 +324,51 @@ public sealed class SshTransitHost : IDisposable
             }
             catch (Exception exception)
             {
-                Console.Error.WriteLine(exception);
+                if (!IsClosedConnectionException(exception))
+                {
+                    Console.Error.WriteLine(exception);
+                }
                 return false;
             }
         }
 
         private void TrySendEof()
         {
+            if (sessionClosed)
+            {
+                return;
+            }
+
             try
             {
                 channel.SendEof();
             }
             catch (Exception exception)
             {
-                Console.Error.WriteLine(exception);
+                if (!IsClosedConnectionException(exception))
+                {
+                    Console.Error.WriteLine(exception);
+                }
             }
         }
 
         private void TrySendClose()
         {
+            if (sessionClosed)
+            {
+                return;
+            }
+
             try
             {
                 channel.SendClose(null);
             }
             catch (Exception exception)
             {
-                Console.Error.WriteLine(exception);
+                if (!IsClosedConnectionException(exception))
+                {
+                    Console.Error.WriteLine(exception);
+                }
             }
         }
 
@@ -288,6 +387,7 @@ public sealed class SshTransitHost : IDisposable
         private TransitProviderOption provider;
         private IReadOnlyList<PaulsTransitData.Models.PTDLineSummary> lines = [];
         private IReadOnlyList<PaulsTransitData.Models.PTDStationSummary> stations = [];
+        private bool closed;
 
         public SshTransitShell(IReadOnlyList<TransitProviderOption> providers, AsciiTransitMapRenderer renderer, Channel channel)
         {
@@ -300,16 +400,28 @@ public sealed class SshTransitHost : IDisposable
         public void Start(string? commandText)
         {
             channel.DataReceived += (_, data) => OnData(data.Span);
-            channel.CloseReceived += (_, _) => channel.SendClose(null);
+            channel.CloseReceived += (_, _) => Close();
             _ = Task.Run(async () =>
             {
-                await RefreshAsync().ConfigureAwait(false);
-                if (!string.IsNullOrWhiteSpace(commandText))
+                try
                 {
-                    await ExecuteAsync(commandText).ConfigureAwait(false);
-                    channel.SendEof();
-                    channel.SendClose(null);
-                    return;
+                    await RefreshAsync().ConfigureAwait(false);
+                    if (!string.IsNullOrWhiteSpace(commandText))
+                    {
+                        await ExecuteAsync(commandText).ConfigureAwait(false);
+                        Close(sendEof: true);
+                        return;
+                    }
+                }
+                catch (Exception exception)
+                {
+                    Console.Error.WriteLine(exception);
+                    Write($"error: {exception.Message}\r\n");
+                    if (!string.IsNullOrWhiteSpace(commandText))
+                    {
+                        Close(sendEof: true);
+                        return;
+                    }
                 }
 
                 Write("\u001b[2J\u001b[HPlatform22 SSH shell\r\n");
@@ -330,7 +442,16 @@ public sealed class SshTransitHost : IDisposable
                     Write("\r\n");
                     _ = Task.Run(async () =>
                     {
-                        await ExecuteAsync(command).ConfigureAwait(false);
+                        try
+                        {
+                            await ExecuteAsync(command).ConfigureAwait(false);
+                        }
+                        catch (Exception exception)
+                        {
+                            Console.Error.WriteLine(exception);
+                            Write($"error: {exception.Message}\r\n");
+                        }
+
                         Prompt();
                     });
                 }
@@ -390,7 +511,7 @@ public sealed class SshTransitHost : IDisposable
                     break;
                 case "quit":
                 case "exit":
-                    channel.SendClose(null);
+                    Close();
                     break;
                 default:
                     Write("Unknown command. Type help.\r\n");
@@ -491,7 +612,50 @@ public sealed class SshTransitHost : IDisposable
 
         private void Write(string value)
         {
-            channel.SendData(Encoding.UTF8.GetBytes(value));
+            if (closed)
+            {
+                return;
+            }
+
+            try
+            {
+                channel.SendData(Encoding.UTF8.GetBytes(value));
+            }
+            catch (Exception exception)
+            {
+                if (!IsClosedConnectionException(exception))
+                {
+                    Console.Error.WriteLine(exception);
+                }
+
+                closed = true;
+            }
+        }
+
+        private void Close(bool sendEof = false)
+        {
+            if (closed)
+            {
+                return;
+            }
+
+            closed = true;
+            try
+            {
+                if (sendEof)
+                {
+                    channel.SendEof();
+                }
+
+                channel.SendClose(null);
+            }
+            catch (Exception exception)
+            {
+                if (!IsClosedConnectionException(exception))
+                {
+                    Console.Error.WriteLine(exception);
+                }
+            }
         }
     }
 }
