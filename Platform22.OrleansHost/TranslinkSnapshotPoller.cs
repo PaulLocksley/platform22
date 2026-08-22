@@ -16,15 +16,33 @@ public sealed class TranslinkSnapshotPoller : BackgroundService
     private readonly IServiceProvider services;
     private readonly ILogger<TranslinkSnapshotPoller> logger;
     private readonly TranslinkPTDClient provider;
-    private readonly string instanceId = Guid.NewGuid().ToString("N");
+    private readonly ITranslinkPollLeaseStore leases;
     private readonly Lazy<ConnectionMultiplexer?> redis;
 
-    public TranslinkSnapshotPoller(IServiceProvider services, ILogger<TranslinkSnapshotPoller> logger, TranslinkPTDClient provider, IConfiguration configuration)
+    public TranslinkSnapshotPoller(
+        IServiceProvider services,
+        ILogger<TranslinkSnapshotPoller> logger,
+        TranslinkPTDClient provider,
+        IConfiguration configuration)
     {
         this.services = services;
         this.logger = logger;
         this.provider = provider;
         redis = new Lazy<ConnectionMultiplexer?>(() => ConnectRedis(configuration));
+        leases = CreateLeaseStore();
+    }
+
+    internal TranslinkSnapshotPoller(
+        IServiceProvider services,
+        ILogger<TranslinkSnapshotPoller> logger,
+        TranslinkPTDClient provider,
+        ITranslinkPollLeaseStore leaseStore)
+    {
+        this.services = services;
+        this.logger = logger;
+        this.provider = provider;
+        leases = leaseStore;
+        redis = new Lazy<ConnectionMultiplexer?>(() => null);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -38,13 +56,13 @@ public sealed class TranslinkSnapshotPoller : BackgroundService
         }
     }
 
-    private async Task PrewarmStaticGtfsAsync(CancellationToken cancellationToken)
+    internal async Task PrewarmStaticGtfsAsync(CancellationToken cancellationToken)
     {
         var stopwatch = Stopwatch.StartNew();
         try
         {
-            if (await IsPrewarmDoneAsync().ConfigureAwait(false)
-                || !await TryAcquireLeaseAsync("platform22:translink:prewarm-lock", TimeSpan.FromMinutes(2)).ConfigureAwait(false))
+            if (await leases.IsPrewarmDoneAsync().ConfigureAwait(false)
+                || !await leases.TryAcquirePrewarmLeaseAsync(TimeSpan.FromMinutes(2)).ConfigureAwait(false))
             {
                 return;
             }
@@ -55,8 +73,8 @@ public sealed class TranslinkSnapshotPoller : BackgroundService
                 .SetStationsJsonAsync(JsonSerializer.Serialize(new StationDirectoryCache(stations, DateTimeOffset.UtcNow)))
                 .ConfigureAwait(false);
 
-            await MarkPrewarmDoneAsync().ConfigureAwait(false);
-            await MarkPollOwnerAsync().ConfigureAwait(false);
+            await leases.MarkPrewarmDoneAsync().ConfigureAwait(false);
+            await leases.MarkPollOwnerAsync().ConfigureAwait(false);
 
             Console.Error.WriteLine($"Translink static GTFS prewarm completed in {stopwatch.ElapsedMilliseconds} ms");
         }
@@ -69,12 +87,12 @@ public sealed class TranslinkSnapshotPoller : BackgroundService
         }
     }
 
-    private async Task PollOnceAsync(CancellationToken cancellationToken)
+    internal async Task PollOnceAsync(CancellationToken cancellationToken)
     {
         var stopwatch = Stopwatch.StartNew();
         try
         {
-            if (!await TryAcquirePollLeaseAsync().ConfigureAwait(false))
+            if (!await leases.TryAcquirePollLeaseAsync().ConfigureAwait(false))
             {
                 return;
             }
@@ -94,8 +112,8 @@ public sealed class TranslinkSnapshotPoller : BackgroundService
 
             Console.Error.WriteLine($"Translink poll completed in {stopwatch.ElapsedMilliseconds} ms");
             logger.LogInformation("Translink poll completed in {ElapsedMs} ms", stopwatch.ElapsedMilliseconds);
-            await MarkPollOwnerAsync().ConfigureAwait(false);
-            await MarkPollDoneAsync().ConfigureAwait(false);
+            await leases.MarkPollOwnerAsync().ConfigureAwait(false);
+            await leases.MarkPollDoneAsync().ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -106,103 +124,15 @@ public sealed class TranslinkSnapshotPoller : BackgroundService
         }
     }
 
-    private async Task<bool> TryAcquirePollLeaseAsync()
+    private ITranslinkPollLeaseStore CreateLeaseStore()
     {
         var database = redis.Value?.GetDatabase();
-        if (database is null)
-        {
-            return true;
-        }
-
-        if (!await IsPrewarmDoneAsync().ConfigureAwait(false))
-        {
-            return false;
-        }
-
-        if (!await TryRenewPollOwnerAsync().ConfigureAwait(false))
-        {
-            return false;
-        }
-
-        var lastPollValue = await database.StringGetAsync("platform22:translink:last-poll").ConfigureAwait(false);
-        if (lastPollValue.HasValue
-            && long.TryParse(lastPollValue.ToString(), out var lastPollTicks)
-            && DateTimeOffset.UtcNow - new DateTimeOffset(lastPollTicks, TimeSpan.Zero) < TimeSpan.FromSeconds(20))
-        {
-            return false;
-        }
-
-        return await TryAcquireLeaseAsync("platform22:translink:poll-lock", TimeSpan.FromSeconds(25)).ConfigureAwait(false);
-    }
-
-    private async Task<bool> TryRenewPollOwnerAsync()
-    {
-        var database = redis.Value?.GetDatabase();
-        if (database is null)
-        {
-            return true;
-        }
-
-        var owner = await database.StringGetAsync("platform22:translink:poll-owner").ConfigureAwait(false);
-        if (!owner.HasValue)
-        {
-            return await database.StringSetAsync("platform22:translink:poll-owner", instanceId, TimeSpan.FromSeconds(90), When.NotExists).ConfigureAwait(false);
-        }
-
-        if (!string.Equals(owner.ToString(), instanceId, StringComparison.Ordinal))
-        {
-            return false;
-        }
-
-        await database.KeyExpireAsync("platform22:translink:poll-owner", TimeSpan.FromSeconds(90)).ConfigureAwait(false);
-        return true;
-    }
-
-    private async Task<bool> TryAcquireLeaseAsync(string key, TimeSpan expiry)
-    {
-        var database = redis.Value?.GetDatabase();
-        return database is null || await database.StringSetAsync(key, instanceId, expiry, When.NotExists).ConfigureAwait(false);
-    }
-
-    private async Task<bool> IsPrewarmDoneAsync()
-    {
-        var database = redis.Value?.GetDatabase();
-        return database is not null && await database.KeyExistsAsync("platform22:translink:prewarm-done").ConfigureAwait(false);
-    }
-
-    private async Task MarkPrewarmDoneAsync()
-    {
-        var database = redis.Value?.GetDatabase();
-        if (database is not null)
-        {
-            await database.StringSetAsync("platform22:translink:prewarm-done", DateTimeOffset.UtcNow.UtcTicks, TimeSpan.FromHours(6)).ConfigureAwait(false);
-        }
-    }
-
-    private async Task MarkPollOwnerAsync()
-    {
-        var database = redis.Value?.GetDatabase();
-        if (database is not null)
-        {
-            await database.StringSetAsync("platform22:translink:poll-owner", instanceId, TimeSpan.FromSeconds(90)).ConfigureAwait(false);
-        }
-    }
-
-    private async Task MarkPollDoneAsync()
-    {
-        var database = redis.Value?.GetDatabase();
-        if (database is not null)
-        {
-            await database.StringSetAsync("platform22:translink:last-poll", DateTimeOffset.UtcNow.UtcTicks, TimeSpan.FromMinutes(5)).ConfigureAwait(false);
-        }
+        return database is null ? NullPollLeaseStore.Instance : new RedisPollLeaseStore(new RedisLeaseKeyValueStore(database));
     }
 
     private static ConnectionMultiplexer? ConnectRedis(IConfiguration configuration)
     {
-        var connectionString = configuration.GetConnectionString("valkey")
-            ?? configuration["ConnectionStrings:valkey"];
-        return string.IsNullOrWhiteSpace(connectionString) ? null : ConnectionMultiplexer.Connect(connectionString);
+        var connectionString = OrleansEnvironment.GetValkeyConnectionString(configuration);
+        return connectionString is null ? null : ConnectionMultiplexer.Connect(connectionString);
     }
-
-    private sealed record StationDirectoryCache(IReadOnlyList<PaulsTransitData.Models.PTDStationSummary> Stations, DateTimeOffset UpdatedAt);
 }

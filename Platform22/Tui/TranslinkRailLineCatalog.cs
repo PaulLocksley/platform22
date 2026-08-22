@@ -34,4 +34,34 @@ public static class TranslinkRailLineCatalog
         return Lines.FirstOrDefault(line => string.Equals(line.Id, lineId, StringComparison.OrdinalIgnoreCase));
     }
 
+    /// <summary>
+    /// Resolves a UI line id (catalog id, short-name-any id, or contains id) against
+    /// the provider. Single definition shared by direct client and Orleans actor.
+    /// </summary>
+    public static Task<PTDLineSnapshot> GetLineSnapshotAsync(TranslinkPTDClient client, string lineId, CancellationToken cancellationToken = default)
+    {
+        var shortNameAnyParts = GetShortNameAnyParts(lineId);
+        if (shortNameAnyParts.Length > 0)
+        {
+            return WithCatalogLineAsync(client.GetLineSnapshotByShortNameAnyAsync(shortNameAnyParts, cancellationToken));
+        }
+
+        if (lineId.StartsWith(ShortNameContainsPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return WithCatalogLineAsync(client.GetLineSnapshotByShortNameContainsAsync(lineId[ShortNameContainsPrefix.Length..], cancellationToken));
+        }
+
+        return WithCatalogLineAsync(client.GetLineSnapshotAsync(lineId, cancellationToken));
+    }
+
+    public static PTDLineSnapshot WithCatalogLine(PTDLineSnapshot snapshot)
+    {
+        var catalogLine = FindLine(snapshot.Line.Id);
+        return catalogLine is null ? snapshot : snapshot with { Line = catalogLine };
+    }
+
+    private static async Task<PTDLineSnapshot> WithCatalogLineAsync(Task<PTDLineSnapshot> snapshotTask)
+    {
+        return WithCatalogLine(await snapshotTask.ConfigureAwait(false));
+    }
 }

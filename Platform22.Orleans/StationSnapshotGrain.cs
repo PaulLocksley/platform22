@@ -1,23 +1,24 @@
 namespace Platform22.Orleans;
 
-using Microsoft.Extensions.Configuration;
+using global::Orleans.Runtime;
 
 public sealed class StationSnapshotGrain : Grain, IStationSnapshotGrain
 {
-    private readonly ValkeyGrainState state;
+    private readonly IPersistentState<JsonGrainState> state;
 
-    public StationSnapshotGrain(IConfiguration configuration)
+    public StationSnapshotGrain([PersistentState("snapshot", Platform22OrleansHosting.GrainStorageName)] IPersistentState<JsonGrainState> state)
     {
-        state = new ValkeyGrainState(configuration, $"platform22:stations:{this.GetPrimaryKeyString()}:snapshot");
+        this.state = state;
     }
 
-    public Task SetSnapshotJsonAsync(string snapshotJson)
+    public async Task SetSnapshotJsonAsync(string snapshotJson)
     {
-        return state.SetAsync(snapshotJson);
+        state.State = new JsonGrainState { Value = snapshotJson };
+        await state.WriteStateAsync().ConfigureAwait(ConfigureAwaitOptions.ContinueOnCapturedContext);
     }
 
     public Task<string?> GetSnapshotJsonAsync()
     {
-        return state.GetAsync();
+        return Task.FromResult(state.State?.Value);
     }
 }

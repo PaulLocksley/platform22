@@ -41,6 +41,13 @@ if (orleansHost2 is not null)
     platform22.WaitFor(orleansHost2);
 }
 
+// Anonymous SSH is a local-development convenience only. Published
+// deployments must mount authorized keys and use publickey auth.
+if (builder.ExecutionContext.IsRunMode)
+{
+    platform22.WithEnvironment("PLATFORM22_SSH_AUTH", "none");
+}
+
 var platform22Node2 = builder.AddProject<Projects.Platform22>("platform22-node-2")
     .WithComputeEnvironment(k8s)
     .WithReference(valkey)
@@ -56,6 +63,11 @@ var platform22Node2 = builder.AddProject<Projects.Platform22>("platform22-node-2
 if (orleansHost2 is not null)
 {
     platform22Node2.WaitFor(orleansHost2);
+}
+
+if (builder.ExecutionContext.IsRunMode)
+{
+    platform22Node2.WithEnvironment("PLATFORM22_SSH_AUTH", "none");
 }
 
 builder.Build().Run();

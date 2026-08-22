@@ -1,23 +1,24 @@
 namespace Platform22.Orleans;
 
-using Microsoft.Extensions.Configuration;
+using global::Orleans.Runtime;
 
 public sealed class StationDirectoryGrain : Grain, IStationDirectoryGrain
 {
-    private readonly ValkeyGrainState state;
+    private readonly IPersistentState<JsonGrainState> state;
 
-    public StationDirectoryGrain(IConfiguration configuration)
+    public StationDirectoryGrain([PersistentState("directory", Platform22OrleansHosting.GrainStorageName)] IPersistentState<JsonGrainState> state)
     {
-        state = new ValkeyGrainState(configuration, "platform22:stations:directory");
+        this.state = state;
     }
 
-    public Task SetStationsJsonAsync(string stationsJson)
+    public async Task SetStationsJsonAsync(string stationsJson)
     {
-        return state.SetAsync(stationsJson);
+        state.State = new JsonGrainState { Value = stationsJson };
+        await state.WriteStateAsync().ConfigureAwait(ConfigureAwaitOptions.ContinueOnCapturedContext);
     }
 
     public Task<string?> GetStationsJsonAsync()
     {
-        return state.GetAsync();
+        return Task.FromResult(state.State?.Value);
     }
 }

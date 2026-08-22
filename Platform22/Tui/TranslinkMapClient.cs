@@ -31,25 +31,7 @@ public sealed class TranslinkMapClient : ITransitMapClient
 
     public Task<PTDLineSnapshot> GetLineSnapshotAsync(string lineId, CancellationToken cancellationToken = default)
     {
-        var shortNameAnyParts = TranslinkRailLineCatalog.GetShortNameAnyParts(lineId);
-        if (shortNameAnyParts.Length > 0)
-        {
-            return WithCatalogLineAsync(client.GetLineSnapshotByShortNameAnyAsync(shortNameAnyParts, cancellationToken));
-        }
-
-        if (lineId.StartsWith(TranslinkRailLineCatalog.ShortNameContainsPrefix, StringComparison.OrdinalIgnoreCase))
-        {
-            return WithCatalogLineAsync(client.GetLineSnapshotByShortNameContainsAsync(lineId[TranslinkRailLineCatalog.ShortNameContainsPrefix.Length..], cancellationToken));
-        }
-
-        return WithCatalogLineAsync(client.GetLineSnapshotAsync(lineId, cancellationToken));
-    }
-
-    private static async Task<PTDLineSnapshot> WithCatalogLineAsync(Task<PTDLineSnapshot> snapshotTask)
-    {
-        var snapshot = await snapshotTask.ConfigureAwait(false);
-        var catalogLine = TranslinkRailLineCatalog.FindLine(snapshot.Line.Id);
-        return catalogLine is null ? snapshot : snapshot with { Line = catalogLine };
+        return TranslinkRailLineCatalog.GetLineSnapshotAsync(client, lineId, cancellationToken);
     }
 
     public Task<PTDStationSnapshot> GetStationSnapshotAsync(string stationId, CancellationToken cancellationToken = default)

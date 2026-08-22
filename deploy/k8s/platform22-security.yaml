@@ -16,11 +16,19 @@ spec:
           secret:
             secretName: platform22-ssh-host-key
             defaultMode: 0400
+        - name: ssh-authorized-keys
+          secret:
+            secretName: platform22-ssh-authorized-keys
+            defaultMode: 0400
       containers:
         - name: platform22
           env:
             - name: PLATFORM22_SSH_HOST_KEY_PATH
               value: /var/run/platform22/ssh/ssh_host_ecdsa_key.pem
+            - name: PLATFORM22_SSH_AUTH
+              value: publickey
+            - name: PLATFORM22_SSH_AUTHORIZED_KEYS_FILE
+              value: /var/run/platform22/ssh-keys/authorized_keys
           ports:
             - name: ssh
               containerPort: 2222
@@ -47,4 +55,7 @@ spec:
               mountPath: /tmp
             - name: ssh-host-key
               mountPath: /var/run/platform22/ssh
+              readOnly: true
+            - name: ssh-authorized-keys
+              mountPath: /var/run/platform22/ssh-keys
               readOnly: true
