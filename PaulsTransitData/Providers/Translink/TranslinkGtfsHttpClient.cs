@@ -38,7 +38,7 @@ public sealed class TranslinkGtfsHttpClient
         var realtimeBytes = await httpClient.GetByteArrayAsync(options.RailVehiclePositionsUrl, cancellationToken).ConfigureAwait(false);
         var lineId = TranslinkLineIds.ToShortNameLineId(routeShortName);
         var routes = ReadRoutes(staticBytes)
-            .Where(route => string.Equals(route.GetValueOrDefault("route_short_name"), routeShortName, StringComparison.OrdinalIgnoreCase))
+            .Where(route => IsRailRoute(route) && string.Equals(route.GetValueOrDefault("route_short_name"), routeShortName, StringComparison.OrdinalIgnoreCase))
             .ToArray();
 
         if (routes.Length == 0)
@@ -59,7 +59,7 @@ public sealed class TranslinkGtfsHttpClient
         var realtimeBytes = await httpClient.GetByteArrayAsync(options.RailVehiclePositionsUrl, cancellationToken).ConfigureAwait(false);
         var lineId = TranslinkLineIds.ToShortNameContainsLineId(routeShortNamePart);
         var routes = ReadRoutes(staticBytes)
-            .Where(route => route.GetValueOrDefault("route_short_name")?.Contains(routeShortNamePart, StringComparison.OrdinalIgnoreCase) == true)
+            .Where(route => IsRailRoute(route) && route.GetValueOrDefault("route_short_name")?.Contains(routeShortNamePart, StringComparison.OrdinalIgnoreCase) == true)
             .ToArray();
 
         if (routes.Length == 0)
@@ -215,7 +215,7 @@ public sealed class TranslinkGtfsHttpClient
         var stopTimes = ReadCsv(archive, "stop_times.txt");
         var trips = ReadCsv(archive, "trips.txt");
         var routes = ReadCsv(archive, "routes.txt");
-        var routeIds = routes.Select(route => route["route_id"]).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var routeIds = routes.Where(IsRailRoute).Select(route => route["route_id"]).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var routeIdByTripId = trips
             .Where(trip => routeIds.Contains(trip["route_id"]))
             .GroupBy(trip => trip["trip_id"], StringComparer.OrdinalIgnoreCase)
@@ -271,6 +271,11 @@ public sealed class TranslinkGtfsHttpClient
     private static bool IsParentStation(IReadOnlyDictionary<string, string> stop)
     {
         return stop.GetValueOrDefault("location_type") == "1";
+    }
+
+    private static bool IsRailRoute(IReadOnlyDictionary<string, string> route)
+    {
+        return route.GetValueOrDefault("route_type") == "2";
     }
 
     private static PTDStationTrainPosition? ToStationTrainPosition(

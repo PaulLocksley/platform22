@@ -234,6 +234,7 @@ public sealed class TranslinkProviderUpdaterTests
         Assert.Equal("Roma Street station", romaStreet.Name);
         Assert.Contains(TranslinkLineIds.ToPtdLineId("BDVL-4997"), romaStreet.LineIds);
         Assert.DoesNotContain(stations, station => station.Id == "roma-street");
+        Assert.DoesNotContain(stations, station => station.Id == "place-bus");
     }
 
     [Fact]
@@ -331,11 +332,13 @@ public sealed class TranslinkProviderUpdaterTests
             AddEntry(archive, "routes.txt", string.Join('\n',
                 "route_id,route_short_name,route_long_name,route_color,route_type",
                 "BDVL-4997,BDVL,Airport - Varsity Lakes,FFC425,2",
-                "BNVL-5068,BNVL,Beenleigh - Varsity Lakes,FFC425,2") + "\n");
+                "BNVL-5068,BNVL,Beenleigh - Varsity Lakes,FFC425,2",
+                "BUS-1,100,Bus Route,005EB8,3") + "\n");
             AddEntry(archive, "trips.txt", string.Join('\n',
                 "route_id,service_id,trip_id",
                 "BDVL-4997,WEEKDAY,bdvl-trip-1",
-                "BNVL-5068,WEEKDAY,bnvl-trip-1") + "\n");
+                "BNVL-5068,WEEKDAY,bnvl-trip-1",
+                "BUS-1,WEEKDAY,bus-trip-1") + "\n");
             AddEntry(archive, "stop_times.txt", string.Join('\n',
                 "trip_id,arrival_time,departure_time,stop_id,stop_sequence",
                 "bdvl-trip-1,08:00:00,08:00:00,roma-street,1",
@@ -346,7 +349,8 @@ public sealed class TranslinkProviderUpdaterTests
                 "bnvl-trip-1,08:20:00,08:20:00,park-road,1",
                 "bnvl-trip-1,09:00:00,09:00:00,helensvale,2",
                 "bnvl-trip-1,09:10:00,09:10:00,nerang,3",
-                "bnvl-trip-1,09:25:00,09:25:00,varsity-lakes,4") + "\n");
+                "bnvl-trip-1,09:25:00,09:25:00,varsity-lakes,4",
+                "bus-trip-1,08:00:00,08:00:00,bus-stop,1") + "\n");
             AddEntry(archive, "stops.txt", string.Join('\n',
                 "stop_id,stop_name,stop_lat,stop_lon,parent_station,location_type",
                 "place-romsta,Roma Street station,-27.4661,153.0180,,1",
@@ -354,7 +358,9 @@ public sealed class TranslinkProviderUpdaterTests
                 "park-road,Park Road station,-27.4996,153.0362,,0",
                 "helensvale,Helensvale station,-27.9256,153.3381,,0",
                 "nerang,Nerang station,-27.9890,153.3405,,0",
-                "varsity-lakes,Varsity Lakes station,-28.0897,153.3892,,0") + "\n");
+                "varsity-lakes,Varsity Lakes station,-28.0897,153.3892,,0",
+                "place-bus,Bus station,-27.0000,153.0000,,1",
+                "bus-stop,Bus platform,-27.0001,153.0001,place-bus,0") + "\n");
         }
 
         return stream.ToArray();

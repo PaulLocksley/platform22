@@ -14,4 +14,12 @@
       </Content>
     </ItemGroup>
 
+    <ItemGroup>
+      <ProjectReference Include="..\PaulsTransitData\PaulsTransitData.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <PackageReference Include="Terminal.Gui" Version="1.17.1" />
+    </ItemGroup>
+
 </Project>

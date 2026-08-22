@@ -9,4 +9,12 @@
     <UserSecretsId>0d7befe6-4571-4577-8902-97a2d5554ed3</UserSecretsId>
   </PropertyGroup>
 
+  <ItemGroup>
+    <PackageReference Include="Aspire.Hosting.Valkey" Version="13.5.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Platform22\Platform22.csproj" />
+  </ItemGroup>
+
 </Project>
