@@ -1,5 +1,6 @@
 namespace PaulsTransitData.Providers.Translink;
 
+using System.Diagnostics;
 using System.Globalization;
 using System.IO.Compression;
 using System.Text;
@@ -10,9 +11,16 @@ using PaulsTransitData.Streams;
 
 public sealed class TranslinkGtfsHttpClient
 {
+    private static readonly TimeSpan StaticGtfsTtl = TimeSpan.FromHours(6);
+    private static readonly TimeSpan RealtimeTtl = TimeSpan.FromSeconds(10);
     private readonly HttpClient httpClient;
     private readonly TranslinkProviderOptions options;
     private readonly TranslinkGtfsMapper mapper = new();
+    private readonly SemaphoreSlim fetchLock = new(1, 1);
+    private readonly object staticGtfsLock = new();
+    private CachedFeed? staticGtfs;
+    private CachedFeed? railVehiclePositions;
+    private ParsedStaticGtfs? parsedStaticGtfs;
 
     public TranslinkGtfsHttpClient(HttpClient httpClient, TranslinkProviderOptions? options = null)
     {
@@ -22,11 +30,12 @@ public sealed class TranslinkGtfsHttpClient
 
     public async Task<PTDProviderLineUpdate> GetLineUpdateAsync(string routeId, CancellationToken cancellationToken = default)
     {
-        var staticBytes = await httpClient.GetByteArrayAsync(options.StaticGtfsUrl, cancellationToken).ConfigureAwait(false);
-        var realtimeBytes = await httpClient.GetByteArrayAsync(options.RailVehiclePositionsUrl, cancellationToken).ConfigureAwait(false);
+        var staticBytes = await FetchBytesAsync("static GTFS", options.StaticGtfsUrl, cancellationToken).ConfigureAwait(false);
+        var realtimeBytes = await FetchBytesAsync("rail vehicle positions", options.RailVehiclePositionsUrl, cancellationToken).ConfigureAwait(false);
+        var staticGtfs = GetParsedStaticGtfs(staticBytes);
         var lineId = TranslinkLineIds.ToPtdLineId(routeId);
 
-        var staticResponse = ParseStaticGtfsByRouteIds(staticBytes, [routeId], lineId, routeId);
+        var staticResponse = ParseStaticGtfsByRouteIds(staticGtfs, [routeId], lineId, routeId);
         var realtimeResponse = ParseRealtime(realtimeBytes, new HashSet<string>([routeId], StringComparer.OrdinalIgnoreCase), lineId);
 
         return mapper.MapLineUpdate(staticResponse, realtimeResponse, lineId);
@@ -34,10 +43,11 @@ public sealed class TranslinkGtfsHttpClient
 
     public async Task<PTDProviderLineUpdate> GetLineUpdateByShortNameAsync(string routeShortName, CancellationToken cancellationToken = default)
     {
-        var staticBytes = await httpClient.GetByteArrayAsync(options.StaticGtfsUrl, cancellationToken).ConfigureAwait(false);
-        var realtimeBytes = await httpClient.GetByteArrayAsync(options.RailVehiclePositionsUrl, cancellationToken).ConfigureAwait(false);
+        var staticBytes = await FetchBytesAsync("static GTFS", options.StaticGtfsUrl, cancellationToken).ConfigureAwait(false);
+        var realtimeBytes = await FetchBytesAsync("rail vehicle positions", options.RailVehiclePositionsUrl, cancellationToken).ConfigureAwait(false);
+        var staticGtfs = GetParsedStaticGtfs(staticBytes);
         var lineId = TranslinkLineIds.ToShortNameLineId(routeShortName);
-        var routes = ReadRoutes(staticBytes)
+        var routes = staticGtfs.Routes
             .Where(route => IsRailRoute(route) && string.Equals(route.GetValueOrDefault("route_short_name"), routeShortName, StringComparison.OrdinalIgnoreCase))
             .ToArray();
 
@@ -47,7 +57,7 @@ public sealed class TranslinkGtfsHttpClient
         }
 
         var routeIds = routes.Select(route => route["route_id"]).ToArray();
-        var staticResponse = ParseStaticGtfsByRouteIds(staticBytes, routeIds, lineId, routeShortName);
+        var staticResponse = ParseStaticGtfsByRouteIds(staticGtfs, routeIds, lineId, routeShortName);
         var realtimeResponse = ParseRealtime(realtimeBytes, routeIds.ToHashSet(StringComparer.OrdinalIgnoreCase), lineId);
 
         return mapper.MapLineUpdate(staticResponse, realtimeResponse, lineId);
@@ -55,10 +65,11 @@ public sealed class TranslinkGtfsHttpClient
 
     public async Task<PTDProviderLineUpdate> GetLineUpdateByShortNameContainsAsync(string routeShortNamePart, CancellationToken cancellationToken = default)
     {
-        var staticBytes = await httpClient.GetByteArrayAsync(options.StaticGtfsUrl, cancellationToken).ConfigureAwait(false);
-        var realtimeBytes = await httpClient.GetByteArrayAsync(options.RailVehiclePositionsUrl, cancellationToken).ConfigureAwait(false);
+        var staticBytes = await FetchBytesAsync("static GTFS", options.StaticGtfsUrl, cancellationToken).ConfigureAwait(false);
+        var realtimeBytes = await FetchBytesAsync("rail vehicle positions", options.RailVehiclePositionsUrl, cancellationToken).ConfigureAwait(false);
+        var staticGtfs = GetParsedStaticGtfs(staticBytes);
         var lineId = TranslinkLineIds.ToShortNameContainsLineId(routeShortNamePart);
-        var routes = ReadRoutes(staticBytes)
+        var routes = staticGtfs.Routes
             .Where(route => IsRailRoute(route) && route.GetValueOrDefault("route_short_name")?.Contains(routeShortNamePart, StringComparison.OrdinalIgnoreCase) == true)
             .ToArray();
 
@@ -68,7 +79,35 @@ public sealed class TranslinkGtfsHttpClient
         }
 
         var routeIds = routes.Select(route => route["route_id"]).ToArray();
-        var staticResponse = ParseStaticGtfsByRouteIds(staticBytes, routeIds, lineId, routeShortNamePart);
+        var staticResponse = ParseStaticGtfsByRouteIds(staticGtfs, routeIds, lineId, routeShortNamePart);
+        var realtimeResponse = ParseRealtime(realtimeBytes, routeIds.ToHashSet(StringComparer.OrdinalIgnoreCase), lineId);
+
+        return mapper.MapLineUpdate(staticResponse, realtimeResponse, lineId);
+    }
+
+    public async Task<PTDProviderLineUpdate> GetLineUpdateByShortNameAnyAsync(IReadOnlyCollection<string> routeShortNameParts, CancellationToken cancellationToken = default)
+    {
+        var parts = routeShortNameParts.Where(part => !string.IsNullOrWhiteSpace(part)).ToArray();
+        if (parts.Length == 0)
+        {
+            throw new ArgumentException("At least one route short name part is required.", nameof(routeShortNameParts));
+        }
+
+        var staticBytes = await FetchBytesAsync("static GTFS", options.StaticGtfsUrl, cancellationToken).ConfigureAwait(false);
+        var realtimeBytes = await FetchBytesAsync("rail vehicle positions", options.RailVehiclePositionsUrl, cancellationToken).ConfigureAwait(false);
+        var staticGtfs = GetParsedStaticGtfs(staticBytes);
+        var lineId = TranslinkLineIds.ToShortNameAnyLineId(parts);
+        var routes = staticGtfs.Routes
+            .Where(route => IsRailRoute(route) && parts.Any(part => route.GetValueOrDefault("route_short_name")?.Contains(part, StringComparison.OrdinalIgnoreCase) == true))
+            .ToArray();
+
+        if (routes.Length == 0)
+        {
+            throw new InvalidOperationException($"No Translink routes matched short name parts '{string.Join(", ", parts)}'.");
+        }
+
+        var routeIds = routes.Select(route => route["route_id"]).ToArray();
+        var staticResponse = ParseStaticGtfsByRouteIds(staticGtfs, routeIds, lineId, string.Join(" / ", parts));
         var realtimeResponse = ParseRealtime(realtimeBytes, routeIds.ToHashSet(StringComparer.OrdinalIgnoreCase), lineId);
 
         return mapper.MapLineUpdate(staticResponse, realtimeResponse, lineId);
@@ -76,31 +115,143 @@ public sealed class TranslinkGtfsHttpClient
 
     public async Task<PTDStationSnapshot> GetStationSnapshotAsync(string stopId, CancellationToken cancellationToken = default)
     {
-        var staticBytes = await httpClient.GetByteArrayAsync(options.StaticGtfsUrl, cancellationToken).ConfigureAwait(false);
-        var realtimeBytes = await httpClient.GetByteArrayAsync(options.RailVehiclePositionsUrl, cancellationToken).ConfigureAwait(false);
+        var staticBytes = await FetchBytesAsync("static GTFS", options.StaticGtfsUrl, cancellationToken).ConfigureAwait(false);
+        var realtimeBytes = await FetchBytesAsync("rail vehicle positions", options.RailVehiclePositionsUrl, cancellationToken).ConfigureAwait(false);
+        var staticGtfs = GetParsedStaticGtfs(staticBytes);
 
-        return ParseStationSnapshot(staticBytes, realtimeBytes, stopId);
+        return ParseStationSnapshot(staticGtfs, realtimeBytes, stopId);
     }
 
     public async Task<IReadOnlyList<PTDStationSummary>> GetStationsAsync(CancellationToken cancellationToken = default)
     {
-        var staticBytes = await httpClient.GetByteArrayAsync(options.StaticGtfsUrl, cancellationToken).ConfigureAwait(false);
-        return ParseStations(staticBytes);
+        var staticBytes = await FetchBytesAsync("static GTFS", options.StaticGtfsUrl, cancellationToken).ConfigureAwait(false);
+        return ParseStations(GetParsedStaticGtfs(staticBytes));
+    }
+
+    private async Task<byte[]> FetchBytesAsync(string name, Uri uri, CancellationToken cancellationToken)
+    {
+        var ttl = string.Equals(uri.AbsoluteUri, options.StaticGtfsUrl.AbsoluteUri, StringComparison.OrdinalIgnoreCase)
+            ? StaticGtfsTtl
+            : RealtimeTtl;
+        var cached = GetCachedFeed(uri);
+        if (cached is not null && DateTimeOffset.UtcNow - cached.FetchedAt < ttl)
+        {
+            return cached.Bytes;
+        }
+
+        await fetchLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            cached = GetCachedFeed(uri);
+            if (cached is not null && DateTimeOffset.UtcNow - cached.FetchedAt < ttl)
+            {
+                return cached.Bytes;
+            }
+
+            var bytes = await FetchBytesUncachedAsync(name, uri, cancellationToken).ConfigureAwait(false);
+            SetCachedFeed(uri, new CachedFeed(bytes, DateTimeOffset.UtcNow));
+            return bytes;
+        }
+        finally
+        {
+            fetchLock.Release();
+        }
+    }
+
+    private async Task<byte[]> FetchBytesUncachedAsync(string name, Uri uri, CancellationToken cancellationToken)
+    {
+        var startedAt = DateTimeOffset.Now;
+        var stopwatch = Stopwatch.StartNew();
+        Console.Error.WriteLine($"Translink fetch start: {name} {uri} at {startedAt:O}");
+
+        using var response = await httpClient.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
+        stopwatch.Stop();
+
+        Console.Error.WriteLine(
+            $"Translink fetch end: {name} status={(int)response.StatusCode} {response.ReasonPhrase} bytes={bytes.Length} durationMs={stopwatch.ElapsedMilliseconds} {GetRateLimitText(response)}");
+        response.EnsureSuccessStatusCode();
+
+        return bytes;
+    }
+
+    private CachedFeed? GetCachedFeed(Uri uri)
+    {
+        return string.Equals(uri.AbsoluteUri, options.StaticGtfsUrl.AbsoluteUri, StringComparison.OrdinalIgnoreCase)
+            ? staticGtfs
+            : railVehiclePositions;
+    }
+
+    private void SetCachedFeed(Uri uri, CachedFeed feed)
+    {
+        if (string.Equals(uri.AbsoluteUri, options.StaticGtfsUrl.AbsoluteUri, StringComparison.OrdinalIgnoreCase))
+        {
+            staticGtfs = feed;
+        }
+        else
+        {
+            railVehiclePositions = feed;
+        }
+    }
+
+    private static string GetRateLimitText(HttpResponseMessage response)
+    {
+        var headers = new[]
+            {
+                "RateLimit-Limit",
+                "RateLimit-Remaining",
+                "RateLimit-Reset",
+                "X-RateLimit-Limit",
+                "X-RateLimit-Remaining",
+                "X-RateLimit-Reset",
+                "Retry-After"
+            }
+            .Select(header => TryGetHeader(response, header))
+            .Where(value => value is not null)
+            .ToArray();
+
+        return headers.Length == 0 ? "rateLimitHeaders=none" : string.Join(' ', headers);
+    }
+
+    private static string? TryGetHeader(HttpResponseMessage response, string name)
+    {
+        if (response.Headers.TryGetValues(name, out var values) || response.Content.Headers.TryGetValues(name, out values))
+        {
+            return $"{name}={string.Join(',', values)}";
+        }
+
+        return null;
+    }
+
+    private ParsedStaticGtfs GetParsedStaticGtfs(byte[] zipBytes)
+    {
+        lock (staticGtfsLock)
+        {
+            if (parsedStaticGtfs is not null && ReferenceEquals(parsedStaticGtfs.SourceBytes, zipBytes))
+            {
+                return parsedStaticGtfs;
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            using var stream = new MemoryStream(zipBytes);
+            using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
+            var routes = ReadCsv(archive, "routes.txt");
+            var trips = ReadCsv(archive, "trips.txt");
+            var stopTimes = ReadCsv(archive, "stop_times.txt");
+            var stops = ReadCsv(archive, "stops.txt");
+            parsedStaticGtfs = ParsedStaticGtfs.Create(zipBytes, routes, trips, stopTimes, stops);
+            Console.Error.WriteLine($"Translink static GTFS parsed in {stopwatch.ElapsedMilliseconds} ms");
+            return parsedStaticGtfs;
+        }
     }
 
     private static TranslinkGtfsStaticResponse ParseStaticGtfsByRouteIds(
-        byte[] zipBytes,
+        ParsedStaticGtfs staticGtfs,
         IReadOnlyCollection<string> routeIds,
         string lineId,
         string lineName)
     {
-        using var stream = new MemoryStream(zipBytes);
-        using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
-
-        var routes = ReadCsv(archive, "routes.txt");
-        var trips = ReadCsv(archive, "trips.txt");
-        var stopTimes = ReadCsv(archive, "stop_times.txt");
-        var stops = ReadCsv(archive, "stops.txt");
+        var routes = staticGtfs.Routes;
         var routeIdSet = routeIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
         var matchingRoutes = routes.Where(row => routeIdSet.Contains(row["route_id"])).ToArray();
 
@@ -109,26 +260,26 @@ public sealed class TranslinkGtfsHttpClient
             throw new InvalidOperationException($"No Translink routes matched '{lineName}'.");
         }
 
-        var tripIds = trips
-            .Where(row => routeIdSet.Contains(row["route_id"]))
-            .Select(row => row["trip_id"])
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var routeStopTimes = stopTimes
-            .Where(row => tripIds.Contains(row["trip_id"]))
-            .Select(row => new
-            {
-                StopId = row["stop_id"],
-                Sequence = int.Parse(row["stop_sequence"])
-            })
-            .GroupBy(row => row.StopId, StringComparer.OrdinalIgnoreCase)
-            .Select(group => new { StopId = group.Key, Sequence = group.Min(row => row.Sequence) })
+        var representativeTripId = staticGtfs.TripRouteIdByTripId
+            .Where(row => routeIdSet.Contains(row.Value))
+            .Select(row => row.Key)
+            .OrderByDescending(tripId => staticGtfs.StopTimesByTripId.TryGetValue(tripId, out var matchingStopTimes) ? matchingStopTimes.Count : 0)
+            .ThenBy(tripId => tripId, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
+
+        if (representativeTripId is null)
+        {
+            throw new InvalidOperationException($"No Translink trips matched '{lineName}'.");
+        }
+
+        var routeStopTimes = staticGtfs.StopTimesByTripId[representativeTripId]
             .OrderBy(row => row.Sequence)
             .ToArray();
 
         var stopIds = routeStopTimes.Select(row => row.StopId).ToArray();
-        var stopIdSet = stopIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var parsedStops = stops
-            .Where(row => stopIdSet.Contains(row["stop_id"]))
+        var parsedStops = stopIds
+            .Where(staticGtfs.StopById.ContainsKey)
+            .Select(stopId => staticGtfs.StopById[stopId])
             .Select(row => new TranslinkGtfsStop(
                 row["stop_id"],
                 row["stop_name"],
@@ -148,39 +299,22 @@ public sealed class TranslinkGtfsHttpClient
         return new TranslinkGtfsStaticResponse([parsedRoute], parsedStops);
     }
 
-    private static IReadOnlyList<Dictionary<string, string>> ReadRoutes(byte[] zipBytes)
+    private static PTDStationSnapshot ParseStationSnapshot(ParsedStaticGtfs staticGtfs, byte[] protobufBytes, string stopId)
     {
-        using var stream = new MemoryStream(zipBytes);
-        using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
-        return ReadCsv(archive, "routes.txt");
-    }
-
-    private static PTDStationSnapshot ParseStationSnapshot(byte[] zipBytes, byte[] protobufBytes, string stopId)
-    {
-        using var stream = new MemoryStream(zipBytes);
-        using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
-
-        var routes = ReadCsv(archive, "routes.txt");
-        var trips = ReadCsv(archive, "trips.txt");
-        var stopTimes = ReadCsv(archive, "stop_times.txt");
-        var stops = ReadCsv(archive, "stops.txt");
-        var stop = stops.Single(row => string.Equals(row["stop_id"], stopId, StringComparison.OrdinalIgnoreCase));
-        var stationStopIds = stops
-            .Where(row => string.Equals(row["stop_id"], stopId, StringComparison.OrdinalIgnoreCase)
-                || string.Equals(row.GetValueOrDefault("parent_station"), stopId, StringComparison.OrdinalIgnoreCase))
-            .Select(row => row["stop_id"])
+        var stop = staticGtfs.StopById[stopId];
+        var stationStopIds = staticGtfs.ChildStopIdsByParent.TryGetValue(stopId, out var childStopIds)
+            ? childStopIds.Prepend(stopId).ToArray()
+            : [stopId];
+        var tripIdsServingStop = stationStopIds
+            .Where(staticGtfs.TripIdsByStopId.ContainsKey)
+            .SelectMany(stationStopId => staticGtfs.TripIdsByStopId[stationStopId])
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var tripIdsServingStop = stopTimes
-            .Where(row => stationStopIds.Contains(row["stop_id"]))
-            .Select(row => row["trip_id"])
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var routeIds = trips
-            .Where(row => tripIdsServingStop.Contains(row["trip_id"]))
-            .Select(row => row["route_id"])
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var routeById = routes
-            .Where(row => routeIds.Contains(row["route_id"]))
-            .ToDictionary(row => row["route_id"], StringComparer.OrdinalIgnoreCase);
+        var routeById = tripIdsServingStop
+            .Where(staticGtfs.TripRouteIdByTripId.ContainsKey)
+            .Select(tripId => staticGtfs.TripRouteIdByTripId[tripId])
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Where(staticGtfs.RouteById.ContainsKey)
+            .ToDictionary(routeId => routeId, routeId => staticGtfs.RouteById[routeId], StringComparer.OrdinalIgnoreCase);
         var feed = FeedMessage.Parser.ParseFrom(protobufBytes);
         var feedTimestamp = feed.Header is { HasTimestamp: true }
             ? DateTimeOffset.FromUnixTimeSeconds((long)feed.Header.Timestamp)
@@ -206,37 +340,15 @@ public sealed class TranslinkGtfsHttpClient
         return new PTDStationSnapshot(station, trainPositions, updatedAt);
     }
 
-    private static IReadOnlyList<PTDStationSummary> ParseStations(byte[] zipBytes)
+    private static IReadOnlyList<PTDStationSummary> ParseStations(ParsedStaticGtfs staticGtfs)
     {
-        using var stream = new MemoryStream(zipBytes);
-        using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
-
-        var stops = ReadCsv(archive, "stops.txt");
-        var stopTimes = ReadCsv(archive, "stop_times.txt");
-        var trips = ReadCsv(archive, "trips.txt");
-        var routes = ReadCsv(archive, "routes.txt");
-        var routeIds = routes.Where(IsRailRoute).Select(route => route["route_id"]).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var routeIdByTripId = trips
-            .Where(trip => routeIds.Contains(trip["route_id"]))
-            .GroupBy(trip => trip["trip_id"], StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(group => group.Key, group => group.First()["route_id"], StringComparer.OrdinalIgnoreCase);
-        var lineIdsByStopId = stopTimes
-            .Where(stopTime => routeIdByTripId.ContainsKey(stopTime["trip_id"]))
-            .GroupBy(stopTime => stopTime["stop_id"], StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(
-                group => group.Key,
-                group => group.Select(stopTime => TranslinkLineIds.ToPtdLineId(routeIdByTripId[stopTime["trip_id"]]))
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .ToArray(),
-                StringComparer.OrdinalIgnoreCase);
-        var stopById = stops.ToDictionary(stop => stop["stop_id"], StringComparer.OrdinalIgnoreCase);
-        var stationIds = stops
+        var stationIds = staticGtfs.Stops
             .Where(stop => IsParentStation(stop) || string.IsNullOrWhiteSpace(stop.GetValueOrDefault("parent_station")))
             .Select(stop => stop["stop_id"])
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         return stationIds
-            .Select(stationId => ToStationSummary(stationId, stops, stopById, lineIdsByStopId))
+            .Select(stationId => ToStationSummary(stationId, staticGtfs))
             .Where(station => station.LineIds.Count > 0)
             .OrderBy(station => station.Name, StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -244,18 +356,14 @@ public sealed class TranslinkGtfsHttpClient
 
     private static PTDStationSummary ToStationSummary(
         string stationId,
-        IReadOnlyList<Dictionary<string, string>> stops,
-        IReadOnlyDictionary<string, Dictionary<string, string>> stopById,
-        IReadOnlyDictionary<string, string[]> lineIdsByStopId)
+        ParsedStaticGtfs staticGtfs)
     {
-        var station = stopById[stationId];
-        var childStopIds = stops
-            .Where(stop => string.Equals(stop.GetValueOrDefault("parent_station"), stationId, StringComparison.OrdinalIgnoreCase))
-            .Select(stop => stop["stop_id"]);
+        var station = staticGtfs.StopById[stationId];
+        var childStopIds = staticGtfs.ChildStopIdsByParent.GetValueOrDefault(stationId, []);
         var relatedStopIds = childStopIds.Prepend(stationId).ToArray();
         var lineIds = relatedStopIds
-            .Where(lineIdsByStopId.ContainsKey)
-            .SelectMany(stopId => lineIdsByStopId[stopId])
+            .Where(staticGtfs.LineIdsByStopId.ContainsKey)
+            .SelectMany(stopId => staticGtfs.LineIdsByStopId[stopId])
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Order()
             .ToArray();
@@ -444,4 +552,99 @@ public sealed class TranslinkGtfsHttpClient
     {
         return double.TryParse(value, CultureInfo.InvariantCulture, out var parsed) ? parsed : null;
     }
+
+    private sealed record CachedFeed(byte[] Bytes, DateTimeOffset FetchedAt);
+
+    private sealed record ParsedStaticGtfs(
+        byte[] SourceBytes,
+        IReadOnlyList<Dictionary<string, string>> Routes,
+        IReadOnlyList<Dictionary<string, string>> Stops,
+        IReadOnlyDictionary<string, Dictionary<string, string>> RouteById,
+        IReadOnlyDictionary<string, Dictionary<string, string>> StopById,
+        IReadOnlyDictionary<string, string> TripRouteIdByTripId,
+        IReadOnlyDictionary<string, IReadOnlyList<StopTimeRow>> StopTimesByTripId,
+        IReadOnlyDictionary<string, IReadOnlyList<string>> TripIdsByStopId,
+        IReadOnlyDictionary<string, IReadOnlyList<string>> ChildStopIdsByParent,
+        IReadOnlyDictionary<string, string[]> LineIdsByStopId)
+    {
+        public static ParsedStaticGtfs Create(
+            byte[] sourceBytes,
+            IReadOnlyList<Dictionary<string, string>> routes,
+            IReadOnlyList<Dictionary<string, string>> trips,
+            IReadOnlyList<Dictionary<string, string>> stopTimes,
+            IReadOnlyList<Dictionary<string, string>> stops)
+        {
+            var routeById = routes.ToDictionary(route => route["route_id"], StringComparer.OrdinalIgnoreCase);
+            var stopById = stops.ToDictionary(stop => stop["stop_id"], StringComparer.OrdinalIgnoreCase);
+            var railRouteIds = routes.Where(IsRailRoute).Select(route => route["route_id"]).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var tripRouteIdByTripId = trips
+                .GroupBy(trip => trip["trip_id"], StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(group => group.Key, group => group.First()["route_id"], StringComparer.OrdinalIgnoreCase);
+            var stopTimesByTripId = new Dictionary<string, List<StopTimeRow>>(StringComparer.OrdinalIgnoreCase);
+            var tripIdsByStopId = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+            var lineIdsByStopId = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var stopTime in stopTimes)
+            {
+                var tripId = stopTime["trip_id"];
+                if (!tripRouteIdByTripId.TryGetValue(tripId, out var routeId))
+                {
+                    continue;
+                }
+
+                var stopId = stopTime["stop_id"];
+                var row = new StopTimeRow(stopId, int.Parse(stopTime["stop_sequence"]));
+                if (!stopTimesByTripId.TryGetValue(tripId, out var tripStopTimes))
+                {
+                    tripStopTimes = [];
+                    stopTimesByTripId[tripId] = tripStopTimes;
+                }
+
+                tripStopTimes.Add(row);
+
+                if (!tripIdsByStopId.TryGetValue(stopId, out var stopTripIds))
+                {
+                    stopTripIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    tripIdsByStopId[stopId] = stopTripIds;
+                }
+
+                stopTripIds.Add(tripId);
+
+                if (!railRouteIds.Contains(routeId))
+                {
+                    continue;
+                }
+
+                if (!lineIdsByStopId.TryGetValue(stopId, out var lineIds))
+                {
+                    lineIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    lineIdsByStopId[stopId] = lineIds;
+                }
+
+                lineIds.Add(TranslinkLineIds.ToPtdLineId(routeId));
+            }
+
+            var childStopIdsByParent = stops
+                .Where(stop => !string.IsNullOrWhiteSpace(stop.GetValueOrDefault("parent_station")))
+                .GroupBy(stop => stop["parent_station"], StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => (IReadOnlyList<string>)group.Select(stop => stop["stop_id"]).ToArray(),
+                    StringComparer.OrdinalIgnoreCase);
+
+            return new ParsedStaticGtfs(
+                sourceBytes,
+                routes,
+                stops,
+                routeById,
+                stopById,
+                tripRouteIdByTripId,
+                stopTimesByTripId.ToDictionary(row => row.Key, row => (IReadOnlyList<StopTimeRow>)row.Value, StringComparer.OrdinalIgnoreCase),
+                tripIdsByStopId.ToDictionary(row => row.Key, row => (IReadOnlyList<string>)row.Value.ToArray(), StringComparer.OrdinalIgnoreCase),
+                childStopIdsByParent,
+                lineIdsByStopId.ToDictionary(row => row.Key, row => row.Value.ToArray(), StringComparer.OrdinalIgnoreCase));
+        }
+    }
+
+    private sealed record StopTimeRow(string StopId, int Sequence);
 }

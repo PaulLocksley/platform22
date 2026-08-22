@@ -18,4 +18,9 @@ public static class TranslinkLineIds
     {
         return $"{ProviderId}:short-name-contains:{routeShortNamePart}";
     }
+
+    public static string ToShortNameAnyLineId(params string[] routeShortNameParts)
+    {
+        return $"{ProviderId}:short-name-any:{string.Join(',', routeShortNameParts)}";
+    }
 }

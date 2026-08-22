@@ -10,6 +10,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Aspire.Hosting.Kubernetes" Version="13.5.2-preview.1.26421.6" />
     <PackageReference Include="Aspire.Hosting.Valkey" Version="13.5.2" />
   </ItemGroup>
 

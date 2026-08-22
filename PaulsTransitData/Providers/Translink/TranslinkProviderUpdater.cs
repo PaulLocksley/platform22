@@ -31,6 +31,12 @@ public sealed class TranslinkProviderUpdater
         await lineStateStore.ApplyUpdateAsync(update, cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task RefreshLineByShortNameAnyAsync(IReadOnlyCollection<string> routeShortNameParts, CancellationToken cancellationToken = default)
+    {
+        var update = await providerClient.GetLineUpdateByShortNameAnyAsync(routeShortNameParts, cancellationToken).ConfigureAwait(false);
+        await lineStateStore.ApplyUpdateAsync(update, cancellationToken).ConfigureAwait(false);
+    }
+
     public Task<Models.PTDStationSnapshot> GetStationSnapshotAsync(string stopId, CancellationToken cancellationToken = default)
     {
         return providerClient.GetStationSnapshotAsync(stopId, cancellationToken);

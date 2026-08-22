@@ -27,6 +27,7 @@ public sealed class AsciiTransitMapRendererTests
         Assert.Contains("o  1: Stop 1", output);
         Assert.Contains("o  2: Stop 2", output);
         Assert.Contains("train-1", output);
+        Assert.Contains('>', output.Split(Environment.NewLine)[2]);
         Assert.Contains("Legend: o stop, > outbound/train forward", output);
     }
 

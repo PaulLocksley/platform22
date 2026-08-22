@@ -45,6 +45,13 @@ public sealed class TranslinkPTDClient : IPTDClient, IPTDStationClient
         return await client.GetLineSnapshotAsync(TranslinkLineIds.ToShortNameContainsLineId(routeShortNamePart), cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task<PTDLineSnapshot> GetLineSnapshotByShortNameAnyAsync(IEnumerable<string> routeShortNameParts, CancellationToken cancellationToken = default)
+    {
+        var parts = routeShortNameParts.Where(part => !string.IsNullOrWhiteSpace(part)).ToArray();
+        await updater.RefreshLineByShortNameAnyAsync(parts, cancellationToken).ConfigureAwait(false);
+        return await client.GetLineSnapshotAsync(TranslinkLineIds.ToShortNameAnyLineId(parts), cancellationToken).ConfigureAwait(false);
+    }
+
     public Task<PTDStationSnapshot> GetStationSnapshotAsync(string stopId, CancellationToken cancellationToken = default)
     {
         return updater.GetStationSnapshotAsync(stopId, cancellationToken);

@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform22
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: ssh-host-key
+          secret:
+            secretName: platform22-ssh-host-key
+            defaultMode: 0400
+      containers:
+        - name: platform22
+          env:
+            - name: PLATFORM22_SSH_HOST_KEY_PATH
+              value: /var/run/platform22/ssh/ssh_host_ecdsa_key.pem
+          ports:
+            - name: ssh
+              containerPort: 2222
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: ssh
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: ssh
+            periodSeconds: 20
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: ssh-host-key
+              mountPath: /var/run/platform22/ssh
+              readOnly: true

@@ -1,17 +1,23 @@
 namespace Platform22.Orleans;
 
+using Microsoft.Extensions.Configuration;
+
 public sealed class LineSnapshotGrain : Grain, ILineSnapshotGrain
 {
-    private string? snapshotJson;
+    private readonly ValkeyGrainState state;
+
+    public LineSnapshotGrain(IConfiguration configuration)
+    {
+        state = new ValkeyGrainState(configuration, $"platform22:lines:{this.GetPrimaryKeyString()}:snapshot");
+    }
 
     public Task SetSnapshotJsonAsync(string snapshotJson)
     {
-        this.snapshotJson = snapshotJson;
-        return Task.CompletedTask;
+        return state.SetAsync(snapshotJson);
     }
 
     public Task<string?> GetSnapshotJsonAsync()
     {
-        return Task.FromResult(snapshotJson);
+        return state.GetAsync();
     }
 }

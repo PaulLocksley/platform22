@@ -1,0 +1,13 @@
+resources:
+  # Set this to the Aspire-published Kubernetes output directory.
+  - ../../publish/k8s
+
+patches:
+  - path: platform22-security.yaml
+    target:
+      kind: Deployment
+      name: platform22
+  - path: orleans-host-security.yaml
+    target:
+      kind: Deployment
+      name: orleans-host

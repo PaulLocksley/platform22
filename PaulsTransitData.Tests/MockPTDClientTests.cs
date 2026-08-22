@@ -68,6 +68,22 @@ public sealed class MockPTDClientTests
     }
 
     [Fact]
+    public async Task MockLineTrainStopIdsExistInLineStops()
+    {
+        var client = new MockPTDClient();
+        var line = (await client.GetLinesAsync()).First();
+
+        var snapshot = await client.GetLineSnapshotAsync(line.Id);
+
+        var stopIds = snapshot.Stops.Select(stop => stop.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        Assert.All(snapshot.TrainPositions, train =>
+        {
+            Assert.True(train.LastStopId is null || stopIds.Contains(train.LastStopId));
+            Assert.True(train.NextStopId is null || stopIds.Contains(train.NextStopId));
+        });
+    }
+
+    [Fact]
     public async Task CoreStationSnapshotHasTrainsFromAllLines()
     {
         var client = new MockPTDClient(new FixedTimeProvider(DateTimeOffset.UnixEpoch));
