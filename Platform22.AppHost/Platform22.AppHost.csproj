@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Platform22\Platform22.csproj" />
+    <ProjectReference Include="..\Platform22.OrleansHost\Platform22.OrleansHost.csproj" />
   </ItemGroup>
 
 </Project>

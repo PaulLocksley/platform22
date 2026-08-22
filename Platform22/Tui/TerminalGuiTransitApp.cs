@@ -20,12 +20,15 @@ public sealed class TerminalGuiTransitApp
     private int selectedIndex;
     private string? selectedItemId;
     private bool filterEditing;
+    private bool loadingProvider;
+    private string? loadError;
     private Label? header;
     private Label? status;
     private ColoredTransitMapView? mapView;
     private ListView? selectorView;
     private Window? window;
     private MenuBar? menuBar;
+    private Window? pickerWindow;
     private Timer? repaintTimer;
     private Timer? dataRefreshTimer;
     private bool updatingSelector;
@@ -106,7 +109,17 @@ public sealed class TerminalGuiTransitApp
                 HandleKey(args.KeyEvent);
                 args.Handled = true;
             };
+            window.KeyDown += args =>
+            {
+                HandleKey(args.KeyEvent);
+                args.Handled = true;
+            };
             top.KeyPress += args =>
+            {
+                HandleKey(args.KeyEvent);
+                args.Handled = true;
+            };
+            top.KeyDown += args =>
             {
                 HandleKey(args.KeyEvent);
                 args.Handled = true;
@@ -128,17 +141,21 @@ public sealed class TerminalGuiTransitApp
 
     private void HandleKey(KeyEvent keyEvent)
     {
-        if (!filterEditing && keyEvent.KeyValue == 'L')
+        if (!filterEditing && IsMenuShortcut(keyEvent, 'P', Key.P))
         {
-            OpenMenu(1);
-            Refresh();
+            ShowProviderPicker();
             return;
         }
 
-        if (!filterEditing && keyEvent.KeyValue == 'S')
+        if (!filterEditing && IsMenuShortcut(keyEvent, 'L', Key.L))
         {
-            OpenMenu(2);
-            Refresh();
+            ShowLinePicker();
+            return;
+        }
+
+        if (!filterEditing && IsMenuShortcut(keyEvent, 'S', Key.S))
+        {
+            ShowStationPicker();
             return;
         }
 
@@ -261,10 +278,12 @@ public sealed class TerminalGuiTransitApp
         var items = GetItems();
         if (items.Count == 0)
         {
-            header.Text = $"{client.Name} | {mode} | filter: {filter} | no matches";
+            header.Text = loadingProvider
+                ? $"{client.Name} | {mode} | loading..."
+                : $"{client.Name} | {mode} | filter: {filter} | no matches";
             mapView.Text = string.Empty;
             UpdateSelector([]);
-            status.Text = "Type to filter, Tab switch, q quit";
+            status.Text = loadError ?? "Type to filter, Tab switch, q quit";
             return;
         }
 
@@ -279,9 +298,17 @@ public sealed class TerminalGuiTransitApp
 
         selectedIndex = Math.Clamp(selectedIndex, 0, items.Count - 1);
         selectedItemId = items[selectedIndex].Id;
-        var rendered = mode == TransitTuiMode.Lines
-            ? RenderSelectedLine(items[selectedIndex].Id)
-            : RenderSelectedStation(items[selectedIndex].Id);
+        string rendered;
+        try
+        {
+            rendered = mode == TransitTuiMode.Lines
+                ? RenderSelectedLine(items[selectedIndex].Id)
+                : RenderSelectedStation(items[selectedIndex].Id);
+        }
+        catch (Exception exception)
+        {
+            rendered = $"Unable to render {mode.ToString().ToLowerInvariant()}: {exception.Message}";
+        }
 
         var filterMode = filterEditing ? "FILTER" : "MAP";
         header.Text = $"{client.Name} | {mode} | {filterMode} | filter: {filter} | selected: {items[selectedIndex].Name} | {selectedIndex + 1}/{items.Count}";
@@ -364,6 +391,11 @@ public sealed class TerminalGuiTransitApp
         };
     }
 
+    private static bool IsMenuShortcut(KeyEvent keyEvent, char keyValue, Key key)
+    {
+        return keyEvent.KeyValue == keyValue || (keyEvent.Key == key && keyEvent.KeyValue != char.ToLowerInvariant(keyValue));
+    }
+
     private static ColorScheme DarkColorScheme(Color foreground)
     {
         var driver = Application.Driver;
@@ -419,15 +451,32 @@ public sealed class TerminalGuiTransitApp
     {
         client = provider.Client;
         mode = TransitTuiMode.Lines;
+        lines = [];
+        stations = [];
         selectedIndex = 0;
         selectedItemId = null;
         filter = string.Empty;
         panX = 0;
         panY = 0;
+        loadingProvider = true;
+        loadError = null;
+        Refresh();
         _ = Task.Run(async () =>
         {
-            await LoadCurrentProviderAsync().ConfigureAwait(false);
-            InvokeRefresh();
+            try
+            {
+                await LoadCurrentProviderAsync().ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine(exception);
+                loadError = exception.Message;
+            }
+            finally
+            {
+                loadingProvider = false;
+                InvokeRefresh();
+            }
         });
     }
 
@@ -486,8 +535,96 @@ public sealed class TerminalGuiTransitApp
             return;
         }
 
-        var openMenu = typeof(MenuBar).GetMethod("OpenMenu", BindingFlags.Instance | BindingFlags.NonPublic, [typeof(int), typeof(int), typeof(MenuBarItem)]);
-        openMenu?.Invoke(menuBar, [index, -1, null]);
+        var openMenu = typeof(MenuBar).GetMethod("OpenMenu", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, [typeof(int), typeof(int), typeof(MenuBarItem)]);
+        if (index >= 0 && index < menuBar.Menus.Length)
+        {
+            openMenu?.Invoke(menuBar, [GetMenuX(index), -1, menuBar.Menus[index]]);
+        }
+    }
+
+    private void ShowProviderPicker()
+    {
+        ShowPicker("Providers", GetMenuX(0), providers.Select(provider => provider.Name).ToArray(), index => SwitchProvider(providers[index]));
+    }
+
+    private void ShowLinePicker()
+    {
+        var items = TransitFilter.FilterLines(lines, filter).ToArray();
+        ShowPicker("Line view", GetMenuX(1), items.Select(line => line.Name).ToArray(), index => SelectLine(items[index].Id));
+    }
+
+    private void ShowStationPicker()
+    {
+        var items = TransitFilter.FilterStations(stations, filter).ToArray();
+        ShowPicker("Station view", GetMenuX(2), items.Select(station => station.Name).ToArray(), index => SelectStation(items[index].Id));
+    }
+
+    private void ShowPicker(string title, int x, IReadOnlyList<string> items, Action<int> select)
+    {
+        ClosePicker();
+        if (items.Count == 0 || Application.Top is null)
+        {
+            return;
+        }
+
+        var width = Math.Clamp(items.Max(item => item.Length) + 4, 20, 54);
+        var height = Math.Clamp(items.Count + 2, 3, Math.Max(3, Application.Top.Frame.Height - 2));
+        var listView = new ListView(items.ToArray())
+        {
+            X = 0,
+            Y = 0,
+            Width = Dim.Fill(),
+            Height = Dim.Fill()
+        };
+        pickerWindow = new Window(title)
+        {
+            X = Math.Min(x, Math.Max(0, Application.Top.Frame.Width - width)),
+            Y = 1,
+            Width = width,
+            Height = height,
+            ColorScheme = DarkColorScheme(Color.White)
+        };
+        listView.OpenSelectedItem += args =>
+        {
+            ClosePicker();
+            select(args.Item);
+        };
+        pickerWindow.KeyPress += args =>
+        {
+            if (args.KeyEvent.Key is Key.Esc)
+            {
+                ClosePicker();
+                args.Handled = true;
+            }
+        };
+
+        pickerWindow.Add(listView);
+        Application.Top.Add(pickerWindow);
+        listView.SetFocus();
+    }
+
+    private void ClosePicker()
+    {
+        if (pickerWindow is null || Application.Top is null)
+        {
+            return;
+        }
+
+        Application.Top.Remove(pickerWindow);
+        pickerWindow = null;
+        window?.SetFocus();
+    }
+
+    private static int GetMenuX(int index)
+    {
+        var x = 1;
+        var labels = new[] { "Providers", "Line view", "Station view", "Actions" };
+        for (var i = 0; i < Math.Clamp(index, 0, labels.Length); i++)
+        {
+            x += labels[i].Length + 2;
+        }
+
+        return x;
     }
 
     private void SelectStation(string stationId)

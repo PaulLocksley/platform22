@@ -5,18 +5,19 @@ using PaulsTransitData.Providers.Translink;
 
 public sealed class TranslinkMapClient : ITransitMapClient
 {
-    private readonly TranslinkMapActor actor;
+    private const string ShortNameContainsPrefix = "translink:short-name-contains:";
+    private readonly TranslinkPTDClient client;
 
     public TranslinkMapClient(TranslinkPTDClient client)
     {
-        actor = new TranslinkMapActor(client);
+        this.client = client;
     }
 
     public string Name => "Translink";
 
     public Task RefreshAsync(CancellationToken cancellationToken = default)
     {
-        return actor.RefreshAsync(cancellationToken);
+        return client.GetStationsAsync(cancellationToken);
     }
 
     public Task<IReadOnlyList<PTDLineSummary>> GetLinesAsync(CancellationToken cancellationToken = default)
@@ -29,16 +30,21 @@ public sealed class TranslinkMapClient : ITransitMapClient
 
     public Task<IReadOnlyList<PTDStationSummary>> GetStationsAsync(CancellationToken cancellationToken = default)
     {
-        return actor.GetStationsAsync();
+        return client.GetStationsAsync(cancellationToken);
     }
 
     public Task<PTDLineSnapshot> GetLineSnapshotAsync(string lineId, CancellationToken cancellationToken = default)
     {
-        return actor.GetLineSnapshotAsync(lineId);
+        if (lineId.StartsWith(ShortNameContainsPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return client.GetLineSnapshotByShortNameContainsAsync(lineId[ShortNameContainsPrefix.Length..], cancellationToken);
+        }
+
+        return client.GetLineSnapshotAsync(lineId, cancellationToken);
     }
 
     public Task<PTDStationSnapshot> GetStationSnapshotAsync(string stationId, CancellationToken cancellationToken = default)
     {
-        return actor.GetStationSnapshotAsync(stationId);
+        return client.GetStationSnapshotAsync(stationId, cancellationToken);
     }
 }

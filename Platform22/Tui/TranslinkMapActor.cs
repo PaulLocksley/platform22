@@ -1,162 +1,197 @@
 namespace Platform22.Tui;
 
-using System.Threading.Channels;
+using System.Net;
+using System.Net.Sockets;
+using System.Text.Json;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using PaulsTransitData.Models;
 using PaulsTransitData.Providers.Translink;
+using Platform22.Orleans;
 
 public sealed class TranslinkMapActor : IAsyncDisposable
 {
     private const string ShortNameContainsPrefix = "translink:short-name-contains:";
-    private readonly Channel<IActorMessage> mailbox = Channel.CreateUnbounded<IActorMessage>();
-    private readonly CancellationTokenSource cancellationTokenSource = new();
-    private readonly Task loop;
+    private const string DirectoryKey = "translink";
+    private readonly TranslinkPTDClient providerClient;
+    private readonly HashSet<string> knownLineIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> knownStationIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim refreshLock = new(1, 1);
+    private readonly Task<IClusterClient> clientTask;
+    private readonly Task<IHost>? inProcessHostTask;
+    private readonly Task<IHost>? externalClientHostTask;
 
-    public TranslinkMapActor(TranslinkPTDClient client)
+    public TranslinkMapActor(TranslinkPTDClient providerClient)
     {
-        loop = Task.Run(() => RunAsync(new State(client), cancellationTokenSource.Token));
-    }
-
-    public Task RefreshAsync(CancellationToken cancellationToken = default)
-    {
-        return InvokeAsync<object?>(async state =>
+        this.providerClient = providerClient;
+        if (UseExternalOrleans())
         {
-            await state.RefreshAsync(cancellationToken).ConfigureAwait(false);
-            return null;
-        });
+            externalClientHostTask = StartExternalClientHostAsync();
+            clientTask = GetClientFromHostAsync(externalClientHostTask);
+        }
+        else
+        {
+            inProcessHostTask = StartInProcessOrleansAsync();
+            clientTask = GetClientFromHostAsync(inProcessHostTask);
+        }
     }
 
-    public Task<IReadOnlyList<PTDStationSummary>> GetStationsAsync()
+    public async Task RefreshAsync(CancellationToken cancellationToken = default)
     {
-        return InvokeAsync(state => Task.FromResult(state.Stations));
+        await refreshLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var client = await GetClusterClientAsync().ConfigureAwait(false);
+            var stations = await providerClient.GetStationsAsync(cancellationToken).ConfigureAwait(false);
+            await client.GetGrain<IStationDirectoryGrain>(DirectoryKey)
+                .SetStationsJsonAsync(JsonSerializer.Serialize(stations))
+                .ConfigureAwait(false);
+
+            foreach (var lineId in knownLineIds.ToArray())
+            {
+                var snapshot = await FetchLineSnapshotAsync(lineId, cancellationToken).ConfigureAwait(false);
+                await client.GetGrain<ILineSnapshotGrain>(lineId)
+                    .SetSnapshotJsonAsync(JsonSerializer.Serialize(snapshot))
+                    .ConfigureAwait(false);
+            }
+
+            foreach (var stationId in knownStationIds.ToArray())
+            {
+                var snapshot = await providerClient.GetStationSnapshotAsync(stationId, cancellationToken).ConfigureAwait(false);
+                await client.GetGrain<IStationSnapshotGrain>(stationId)
+                    .SetSnapshotJsonAsync(JsonSerializer.Serialize(snapshot))
+                    .ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            refreshLock.Release();
+        }
     }
 
-    public Task<PTDLineSnapshot> GetLineSnapshotAsync(string lineId)
+    public async Task<IReadOnlyList<PTDStationSummary>> GetStationsAsync()
     {
-        return InvokeAsync(state => state.GetLineSnapshotAsync(lineId));
+        var client = await GetClusterClientAsync().ConfigureAwait(false);
+        var json = await client.GetGrain<IStationDirectoryGrain>(DirectoryKey).GetStationsJsonAsync().ConfigureAwait(false);
+        return json is null ? [] : JsonSerializer.Deserialize<PTDStationSummary[]>(json) ?? [];
     }
 
-    public Task<PTDStationSnapshot> GetStationSnapshotAsync(string stationId)
+    public async Task<PTDLineSnapshot> GetLineSnapshotAsync(string lineId)
     {
-        return InvokeAsync(state => state.GetStationSnapshotAsync(stationId));
+        knownLineIds.Add(lineId);
+        var client = await GetClusterClientAsync().ConfigureAwait(false);
+        var grain = client.GetGrain<ILineSnapshotGrain>(lineId);
+        var json = await grain.GetSnapshotJsonAsync().ConfigureAwait(false);
+        if (json is null)
+        {
+            var snapshot = await FetchLineSnapshotAsync(lineId, CancellationToken.None).ConfigureAwait(false);
+            json = JsonSerializer.Serialize(snapshot);
+            await grain.SetSnapshotJsonAsync(json).ConfigureAwait(false);
+        }
+
+        return JsonSerializer.Deserialize<PTDLineSnapshot>(json)!;
+    }
+
+    public async Task<PTDStationSnapshot> GetStationSnapshotAsync(string stationId)
+    {
+        knownStationIds.Add(stationId);
+        var client = await GetClusterClientAsync().ConfigureAwait(false);
+        var grain = client.GetGrain<IStationSnapshotGrain>(stationId);
+        var json = await grain.GetSnapshotJsonAsync().ConfigureAwait(false);
+        if (json is null)
+        {
+            var snapshot = await providerClient.GetStationSnapshotAsync(stationId).ConfigureAwait(false);
+            json = JsonSerializer.Serialize(snapshot);
+            await grain.SetSnapshotJsonAsync(json).ConfigureAwait(false);
+        }
+
+        return JsonSerializer.Deserialize<PTDStationSnapshot>(json)!;
     }
 
     public async ValueTask DisposeAsync()
     {
-        cancellationTokenSource.Cancel();
-        mailbox.Writer.TryComplete();
-        await loop.ConfigureAwait(false);
-        cancellationTokenSource.Dispose();
-    }
-
-    private async Task<T> InvokeAsync<T>(Func<State, Task<T>> action)
-    {
-        var message = new ActorMessage<T>(action);
-        await mailbox.Writer.WriteAsync(message, cancellationTokenSource.Token).ConfigureAwait(false);
-        return await message.Task.ConfigureAwait(false);
-    }
-
-    private async Task RunAsync(State state, CancellationToken cancellationToken)
-    {
-        try
+        if (inProcessHostTask?.IsCompletedSuccessfully == true)
         {
-            await foreach (var message in mailbox.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
-            {
-                await message.ExecuteAsync(state).ConfigureAwait(false);
-            }
+            await inProcessHostTask.Result.StopAsync().ConfigureAwait(false);
+            inProcessHostTask.Result.Dispose();
         }
-        catch (OperationCanceledException)
+
+        if (externalClientHostTask?.IsCompletedSuccessfully == true)
         {
+            await externalClientHostTask.Result.StopAsync().ConfigureAwait(false);
+            externalClientHostTask.Result.Dispose();
         }
     }
 
-    private interface IActorMessage
+    private async Task<IClusterClient> GetClusterClientAsync()
     {
-        Task ExecuteAsync(State state);
+        return await clientTask.ConfigureAwait(false);
     }
 
-    private sealed class ActorMessage<T> : IActorMessage
+    private Task<PTDLineSnapshot> FetchLineSnapshotAsync(string lineId, CancellationToken cancellationToken)
     {
-        private readonly Func<State, Task<T>> action;
-        private readonly TaskCompletionSource<T> taskCompletionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        public ActorMessage(Func<State, Task<T>> action)
+        if (lineId.StartsWith(ShortNameContainsPrefix, StringComparison.OrdinalIgnoreCase))
         {
-            this.action = action;
+            return providerClient.GetLineSnapshotByShortNameContainsAsync(lineId[ShortNameContainsPrefix.Length..], cancellationToken);
         }
 
-        public Task<T> Task => taskCompletionSource.Task;
-
-        public async Task ExecuteAsync(State state)
-        {
-            try
-            {
-                taskCompletionSource.SetResult(await action(state).ConfigureAwait(false));
-            }
-            catch (Exception exception)
-            {
-                taskCompletionSource.SetException(exception);
-            }
-        }
+        return providerClient.GetLineSnapshotAsync(lineId, cancellationToken);
     }
 
-    private sealed class State
+    private static async Task<IHost> StartInProcessOrleansAsync()
     {
-        private readonly TranslinkPTDClient client;
-        private readonly Dictionary<string, PTDLineSnapshot> lineSnapshots = new(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<string, PTDStationSnapshot> stationSnapshots = new(StringComparer.OrdinalIgnoreCase);
-
-        public State(TranslinkPTDClient client)
-        {
-            this.client = client;
-        }
-
-        public IReadOnlyList<PTDStationSummary> Stations { get; private set; } = [];
-
-        public async Task RefreshAsync(CancellationToken cancellationToken)
-        {
-            Stations = await client.GetStationsAsync(cancellationToken).ConfigureAwait(false);
-
-            foreach (var lineId in lineSnapshots.Keys.ToArray())
+        var siloPort = GetFreeTcpPort();
+        var gatewayPort = GetFreeTcpPort();
+        var host = Host.CreateDefaultBuilder()
+            .ConfigureLogging(logging => logging.ClearProviders())
+            .UseOrleans(silo =>
             {
-                lineSnapshots[lineId] = await FetchLineSnapshotAsync(lineId, cancellationToken).ConfigureAwait(false);
-            }
+                silo.UseLocalhostClustering(siloPort, gatewayPort);
+                silo.AddMemoryGrainStorage("Default");
+            })
+            .Build();
 
-            foreach (var stationId in stationSnapshots.Keys.ToArray())
+        await host.StartAsync().ConfigureAwait(false);
+        return host;
+    }
+
+    private static async Task<IClusterClient> GetClientFromHostAsync(Task<IHost> hostTask)
+    {
+        var host = await hostTask.ConfigureAwait(false);
+        return host.Services.GetRequiredService<IClusterClient>();
+    }
+
+    private static async Task<IHost> StartExternalClientHostAsync()
+    {
+        var host = Host.CreateDefaultBuilder()
+            .ConfigureLogging(logging => logging.ClearProviders())
+            .UseOrleansClient(client =>
             {
-                stationSnapshots[stationId] = await client.GetStationSnapshotAsync(stationId, cancellationToken).ConfigureAwait(false);
-            }
-        }
+                client.UseLocalhostClustering(gatewayPort: GetPort("ORLEANS_GATEWAY_PORT", 30000));
+            })
+            .Build();
 
-        public async Task<PTDLineSnapshot> GetLineSnapshotAsync(string lineId)
-        {
-            if (!lineSnapshots.TryGetValue(lineId, out var snapshot))
-            {
-                snapshot = await FetchLineSnapshotAsync(lineId, CancellationToken.None).ConfigureAwait(false);
-                lineSnapshots[lineId] = snapshot;
-            }
+        await host.StartAsync().ConfigureAwait(false);
+        return host;
+    }
 
-            return snapshot;
-        }
+    private static bool UseExternalOrleans()
+    {
+        return string.Equals(Environment.GetEnvironmentVariable("PLATFORM22_ORLEANS_MODE"), "external", StringComparison.OrdinalIgnoreCase);
+    }
 
-        public async Task<PTDStationSnapshot> GetStationSnapshotAsync(string stationId)
-        {
-            if (!stationSnapshots.TryGetValue(stationId, out var snapshot))
-            {
-                snapshot = await client.GetStationSnapshotAsync(stationId).ConfigureAwait(false);
-                stationSnapshots[stationId] = snapshot;
-            }
+    private static int GetPort(string name, int defaultValue)
+    {
+        return int.TryParse(Environment.GetEnvironmentVariable(name), out var port) ? port : defaultValue;
+    }
 
-            return snapshot;
-        }
-
-        private Task<PTDLineSnapshot> FetchLineSnapshotAsync(string lineId, CancellationToken cancellationToken)
-        {
-            if (lineId.StartsWith(ShortNameContainsPrefix, StringComparison.OrdinalIgnoreCase))
-            {
-                return client.GetLineSnapshotByShortNameContainsAsync(lineId[ShortNameContainsPrefix.Length..], cancellationToken);
-            }
-
-            return client.GetLineSnapshotAsync(lineId, cancellationToken);
-        }
+    private static int GetFreeTcpPort()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+        return port;
     }
 }

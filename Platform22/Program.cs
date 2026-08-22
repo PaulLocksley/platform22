@@ -9,7 +9,13 @@ var providers = new[]
 };
 var initialProvider = args.Contains("--translink", StringComparer.OrdinalIgnoreCase) ? providers[1] : providers[0];
 
-if (Console.IsInputRedirected || Console.IsOutputRedirected)
+if (string.Equals(Environment.GetEnvironmentVariable("PLATFORM22_SSH_MODE"), "enabled", StringComparison.OrdinalIgnoreCase))
+{
+    var port = int.TryParse(Environment.GetEnvironmentVariable("PLATFORM22_SSH_PORT"), out var configuredPort) ? configuredPort : 2222;
+    using var host = new SshTransitHost(providers, port);
+    await host.RunAsync();
+}
+else if (Console.IsInputRedirected || Console.IsOutputRedirected)
 {
     var app = new TransitTuiApp(initialProvider.Client, Console.In, Console.Out);
     await app.RunAsync();
